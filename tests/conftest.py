@@ -3,7 +3,7 @@ import torch
 
 import rescomp as rc
 
-ALL_SPECS = ["fp32", "bf16", "fp16", "fp8_e4m3", "int8_tok", "int8_g64", "int4_g16", "int2_g16", "uabs0.05", "mxfp4",
+ALL_SPECS = ["fp32", "bf16", "fp16", "fp8_e4m3", "int8_tok", "int8_g64", "int4_g16", "uabs0.05", "mxfp4",
              "nvfp4", "int4_g16+layerK2", "int4_g16+layerK4+out4", "int4_g16+layerK2+out4+sink1",
              "int4_g16+layerK4+out2+key=bf16", "uabs0.1+out8", "bf16+sink2", "fp16+layerK3+key=fp32"]
 

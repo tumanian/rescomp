@@ -59,8 +59,14 @@ Dependency: `pyarrow`.
 perplexity ratio, generation coherence). Uses the same module-object convention as the sink; the
 `ModelAdapter` protocol goes away once this exists.
 
+## Bytes and devices
+
+The codec (version 2) is pinned to torchao's numerics. Encoding the same activations on a GPU and on the CPU gives
+identical bytes for the plain casts, int8, uabs, mxfp4 and int4 keyframes, and can differ in the last bit for
+nvfp4 and for delta layers (reciprocal scales and accumulation order). Every file is self-consistent: decoding on
+any device returns exactly the reconstruction the encoder computed on the device that wrote it.
+
 ## Status
 
 Built as designed: defaults are 4 GB rotation and 2 GB staging buffer; the offline mode encodes on flush only;
-`rc.open()` reads both the format-2 stem and the single-file RSC1 format. Not done: a background encoder thread;
-retiring `rescomp.evaluate` and the `ModelAdapter` protocol (still used by `scripts/run_models.py`).
+`rc.open()` reads both the format-2 stem and the single-file RSC1 format. Not done: a background encoder thread.

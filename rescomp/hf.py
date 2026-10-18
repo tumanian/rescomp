@@ -1,16 +1,14 @@
-"""Hugging Face causal LMs as a ModelAdapter (optional dependency: transformers).
+"""Hugging Face causal LMs: which modules a Sink hooks, what the header should say, and a loader.
+
+    model, tok = load_model("gpt2")
+    sink = Sink("runs/x", layers=hf_layers(model, [8, 9, 10, 11], tok), spec="balanced")
 
 The site is "resid_post": the output of decoder block l (`model.layers[l]` / `transformer.h[l]`), which is
 TransformerLens `blocks.l.hook_resid_post` when that library loads the model without weight processing.
-
-    model, tok = load_model("gpt2")                       # -> (HFAdapter, tokenizer)
-    logits, acts, _ = model.forward(tokens, capture=[8, 9])
+Only this module imports transformers.
 """
-from contextlib import contextmanager
-
 import torch
 
-from .model import apply_patch
 from .sink import Layers, extract_tokens_generic
 
 BLOCK_ATTRS = ["model.layers", "transformer.h", "model.decoder.layers", "gpt_neox.layers", "layers"]
@@ -22,6 +20,7 @@ CONFIG_KEYS = ["hidden_size", "n_embd", "num_hidden_layers", "n_layer", "num_att
 
 
 def decoder_blocks(model):
+    """(the ModuleList of decoder blocks, its attribute path)."""
     for path in BLOCK_ATTRS:
         m = model
         try:
@@ -34,83 +33,43 @@ def decoder_blocks(model):
     raise ValueError(f"cannot find the decoder block list on {type(model).__name__}; tried {BLOCK_ATTRS}")
 
 
-def _first(o):
-    return o[0] if isinstance(o, tuple) else o
+def moe_layers(model):
+    """Layers whose MLP is a routed mixture of experts (HF layout: block.mlp.gate + block.mlp.experts)."""
+    blocks, _ = decoder_blocks(model)
+    return [l for l, b in enumerate(blocks) if hasattr(getattr(b, "mlp", None), "gate") and hasattr(b.mlp, "experts")]
 
 
-class HFAdapter:
-    def __init__(self, model, tokenizer=None, model_id=None, revision=None):
-        self.model, self.tokenizer = model.eval(), tokenizer
-        self.blocks, self.block_path = decoder_blocks(model)
-        c = model.config
-        self.model_id = model_id or getattr(c, "_name_or_path", None)
-        self.revision = revision or getattr(c, "_commit_hash", None)
-        self.n_layers = len(self.blocks)
-        self.d_model = getattr(c, "hidden_size", None) or getattr(c, "n_embd", None)
+def model_info(model, tokenizer=None, model_id=None, revision=None):
+    """What goes into the file header: id, revision, architecture, sizes, dtype, a config summary."""
+    c = model.config
+    blocks, _ = decoder_blocks(model)
+    cfg = {k: getattr(c, k) for k in CONFIG_KEYS if getattr(c, k, None) is not None}
+    moe = moe_layers(model)
+    if moe:
+        cfg["moe_layers"] = moe
+    return {"id": model_id or getattr(c, "_name_or_path", None), "revision": revision or getattr(c, "_commit_hash", None),
+            "loader": "transformers", "architecture": (getattr(c, "architectures", None) or [type(model).__name__])[0],
+            "n_layers": len(blocks), "d_model": getattr(c, "hidden_size", None) or getattr(c, "n_embd", None),
+            "dtype": str(next(model.parameters()).dtype).removeprefix("torch."),
+            "tokenizer": getattr(tokenizer, "name_or_path", None),
+            "bos_token_id": getattr(tokenizer, "bos_token_id", None), "config": cfg}
 
-    def info(self):
-        c = self.model.config
-        cfg = {k: getattr(c, k) for k in CONFIG_KEYS if getattr(c, k, None) is not None}
-        if self.moe_layers():
-            cfg["moe_layers"] = self.moe_layers()
-        return {"id": self.model_id, "revision": self.revision, "loader": "transformers",
-                "architecture": (getattr(c, "architectures", None) or [type(self.model).__name__])[0],
-                "n_layers": self.n_layers, "d_model": self.d_model,
-                "dtype": str(next(self.model.parameters()).dtype).removeprefix("torch."),
-                "tokenizer": getattr(self.tokenizer, "name_or_path", None),
-                "bos_token_id": getattr(self.tokenizer, "bos_token_id", None), "config": cfg}
 
-    def hook_names(self, layer):
-        return {"hf": f"{self.block_path}.{layer}", "transformer_lens": f"blocks.{layer}.hook_resid_post"}
-
-    @property
-    def device(self):
-        return self.model.get_input_embeddings().weight.device
-
-    def moe_layers(self):
-        """Layers whose MLP is a routed mixture of experts (HF layout: block.mlp.gate + block.mlp.experts)."""
-        return [l for l, b in enumerate(self.blocks)
-                if hasattr(getattr(b, "mlp", None), "gate") and hasattr(b.mlp, "experts")]
-
-    @contextmanager
-    def _hooks(self, capture, patch, routers, acts, routing):
-        handles = []
-        for l in capture:
-            handles.append(self.blocks[l].register_forward_hook(
-                lambda mod, inp, out, l=l: acts.__setitem__(l, _first(out).detach())))
-        for l in (patch or {}):
-            def repl(mod, inp, out, l=l):
-                new = apply_patch(l, _first(out), patch)
-                return (new,) + tuple(out[1:]) if isinstance(out, tuple) else new
-            handles.append(self.blocks[l].register_forward_hook(repl))
-        for l in routers:
-            def route(mod, inp, out, l=l):
-                _, weights, experts = out               # HF TopKRouter: (logits, top-k weights, top-k expert ids)
-                routing[l] = (weights.detach(), experts.detach())
-            handles.append(self.blocks[l].mlp.gate.register_forward_hook(route))
-        try:
-            yield
-        finally:
-            for h in handles:
-                h.remove()
-
-    @torch.no_grad()
-    def forward(self, tokens, capture=(), patch=None, routers=()):
-        moe = self.moe_layers()
-        if any(l not in moe for l in routers):
-            raise ValueError(f"routers {list(routers)} must be MoE layers {moe}")
-        acts, routing = {}, {}
-        B, T = tokens.shape
-        with self._hooks(capture, patch, routers, acts, routing):
-            logits = self.model(tokens.to(self.device), use_cache=False).logits
-        routing = {l: {"experts": e.reshape(B, T, -1).to(torch.int16).cpu(),
-                       "weights": w.reshape(B, T, -1).to(torch.float16).cpu()} for l, (w, e) in routing.items()}
-        return logits, acts, routing
+def hf_layers(model, layers, tokenizer=None, model_id=None, revision=None):
+    """Modules to hook for a Sink: the decoder blocks of `layers`, with header info and the HF token extractor."""
+    blocks, path = decoder_blocks(model)
+    layers = sorted(int(l) for l in layers)
+    if any(not 0 <= l < len(blocks) for l in layers):
+        raise ValueError(f"layers {layers} outside [0, {len(blocks)})")
+    return Layers(modules={l: blocks[l] for l in layers}, root=model,
+                  hook_names={l: {"hf": f"{path}.{l}", "transformer_lens": f"blocks.{l}.hook_resid_post"} for l in layers},
+                  model_info=model_info(model, tokenizer, model_id, revision), extract=extract_tokens_generic,
+                  n_layers=len(blocks))
 
 
 def load_model(model_id, dtype="bfloat16", device=None, revision=None, attn_implementation=None, device_map=None, **kw):
-    """-> (HFAdapter, tokenizer). device_map="auto" spreads a model that does not fit one GPU over all of them
-    (hooks and patches follow each block's own device); otherwise the whole model goes to `device`."""
+    """-> (model in eval mode, tokenizer). device_map="auto" spreads a model that does not fit one GPU over all of
+    them (the Sink follows each block's own device); otherwise the whole model goes to `device`."""
     from transformers import AutoModelForCausalLM, AutoTokenizer
     tok = AutoTokenizer.from_pretrained(model_id, revision=revision)
     if attn_implementation:
@@ -120,14 +79,4 @@ def load_model(model_id, dtype="bfloat16", device=None, revision=None, attn_impl
     model = AutoModelForCausalLM.from_pretrained(model_id, revision=revision, dtype=getattr(torch, dtype), **kw)
     if not device_map:
         model.to(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    return HFAdapter(model, tok, model_id=model_id, revision=revision), tok
-
-
-def hf_layers(model, layers, tokenizer=None, model_id=None, revision=None):
-    """Modules to hook for a Sink: the decoder blocks of `layers`, with the header info of an HFAdapter."""
-    a = HFAdapter(model, tokenizer, model_id=model_id, revision=revision)
-    layers = sorted(int(l) for l in layers)
-    if any(not 0 <= l < a.n_layers for l in layers):
-        raise ValueError(f"layers {layers} outside [0, {a.n_layers})")
-    return Layers(modules={l: a.blocks[l] for l in layers}, root=model, hook_names={l: a.hook_names(l) for l in layers},
-                  model_info=a.info(), extract=extract_tokens_generic, n_layers=a.n_layers)
+    return model.eval(), tok

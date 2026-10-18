@@ -97,7 +97,6 @@ class Sink:
         self._pending_ann = {}
         self._open, self._len = [], {}    # open sequence ids and their current lengths
         self._buffer, self._buffered = [], 0     # encoded chunks waiting for zstd + write
-        self._events = []                         # CUDA events marking the end of each chunk's host copies
         self.n_calls = self.n_incomplete = 0
         self.t0 = time.time()
 

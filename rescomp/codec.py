@@ -185,6 +185,3 @@ def decode(streams, spec, calib=None):
     dec = Decoder(spec, calib, len(streams))
     return torch.stack([dec.decode_layer(i, s) for i, s in enumerate(streams)])
 
-
-def stream_bytes(streams):
-    return sum(t.numel() * t.element_size() for t in streams.values())

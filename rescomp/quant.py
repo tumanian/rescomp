@@ -5,10 +5,10 @@ dequantize(codes, scales) -> fp32. Codes and scales are plain tensors whose dtyp
 dequantize(quantize(v)) is the same on the encoder and the decoder (codec version 2).
 
 Block formats come from torchao and the on-disk format is pinned to its numerics:
-  int{2,4,8}_g<G>      torchao affine quantization, MappingType.SYMMETRIC_NO_CLIPPING_ERR over the full range
+  int{4,8}_g<G>        torchao affine quantization, MappingType.SYMMETRIC_NO_CLIPPING_ERR over the full range
                        [-2^(b-1), 2^(b-1)-1] with one fp16 scale per group of G channels (the scale is the larger
                        of -min/qmin and max/qmax, so nothing clips and the extra negative level is used when it
-                       helps); 4-bit codes packed with torchao's pack_uint4, 2-bit codes 4 per byte here, int8 as is
+                       helps); 4-bit codes packed with torchao's pack_uint4, int8 stored as is
   mxfp4                OCP MX: e2m1 codes, one e8m0 scale per 32 channels (torchao to_mx / to_dtype)
   nvfp4                NVIDIA FP4: e2m1 codes, one e4m3 scale per 16 channels and one fp32 per-tensor scale
                        (torchao nvfp4_quantize; dequantized with its f4 table)
@@ -41,7 +41,7 @@ def qinfo(q):
         return {"kind": "mxfp4", "bits": 4, "group": 32}
     if q.startswith("uabs"):
         return {"kind": "uabs", "step": float(q[4:])}
-    m = re.fullmatch(r"int([248])_g(\d+)", q)
+    m = re.fullmatch(r"int([48])_g(\d+)", q)
     if not m:
         raise ValueError(f"unknown quantizer {q!r}")
     b = int(m[1])
@@ -54,7 +54,7 @@ def check_dim(q, d):
     g = i.get("group")
     if g is not None and (g <= 0 or d % g != 0):
         raise ValueError(f"{q}: group size {g} must divide d={d}")
-    per = {2: 4, 4: 2}.get(i.get("bits"), 1) if i["kind"] in ("int", "nvfp4", "mxfp4") else 1
+    per = 2 if i.get("bits") == 4 else 1
     if d % per != 0:
         raise ValueError(f"{q}: {i['bits']}-bit codes pack {per} per byte, so d={d} must be a multiple of {per}")
 
@@ -65,16 +65,6 @@ def _half_scale(amax, qmax):
 
 def _block(v, G):
     return (1,) * (v.dim() - 1) + (G,)
-
-
-def _pack2(q):
-    """uint8 codes < 4 along the last dim -> 4 per byte (first code in the low bits)."""
-    q = q.unflatten(-1, (-1, 4))
-    return q[..., 0] | (q[..., 1] << 2) | (q[..., 2] << 4) | (q[..., 3] << 6)
-
-
-def _unpack2(c):
-    return torch.stack([(c >> (2 * j)) & 3 for j in range(4)], -1).flatten(-2)
 
 
 # ---------------------------------------------------------------- scales
@@ -131,8 +121,7 @@ def quantize(v, S, q):
         c = qp.quantize_affine(v, _block(v, i["group"]), S[0], zp, torch.int8, qmin, qmax)
         if b == 8:
             return c
-        u = (c.to(torch.int16) - qmin).to(torch.uint8)
-        return mxk.pack_uint4(u) if b == 4 else _pack2(u)
+        return mxk.pack_uint4((c.to(torch.int16) - qmin).to(torch.uint8))
     if k == "nvfp4":
         _, lp = nvfp4_tensor.nvfp4_quantize(v.reshape(-1, v.shape[-1]).contiguous(), 16, S[0])
         return lp.reshape(*v.shape[:-1], -1)
@@ -159,11 +148,7 @@ def dequantize(c, S, q):
         return n.float() * i["step"]
     if k == "int":
         b, qmin, qmax = i["bits"], i["qmin"], i["qmax"]
-        if b == 8:
-            codes = c
-        else:
-            u = mxk.unpack_uint4(c) if b == 4 else _unpack2(c)
-            codes = (u.to(torch.int16) + qmin).to(torch.int8)
+        codes = c if b == 8 else (mxk.unpack_uint4(c).to(torch.int16) + qmin).to(torch.int8)
         zp = torch.zeros_like(S[0], dtype=torch.int32)
         return qp.dequantize_affine(codes, _block(codes, i["group"]), S[0], zp, torch.int8, qmin, qmax,
                                     output_dtype=torch.float32)
@@ -175,9 +160,3 @@ def dequantize(c, S, q):
         return mx_tensor.to_dtype(c, S[0], MX_ELEM, 32, torch.float32)
     raise ValueError(q)
 
-
-def fp4_scales(S, q):
-    """Per-channel fp32 scale of an fp4 code (for bounds and tests)."""
-    if q == "nvfp4":
-        return (S[1].float() * S[0]).repeat_interleave(16, -1)
-    return S[0].float().repeat_interleave(32, -1)

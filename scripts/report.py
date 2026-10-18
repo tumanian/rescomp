@@ -41,7 +41,7 @@ def table(path):
              "|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in sorted(recs, key=lambda r: r["ratio"]):
         fe, le = r["file_eval"], r.get("live_eval") or {}
-        gen = path.parent / f"generations_{Path(r['file']).stem}.jsonl"
+        gen = path.parent / f"generations_{r.get('stem') or Path(r['file']).stem}.jsonl"
         co = coherence_from_generations(gen) if gen.exists() else {}
         lines.append("| `%s` | %.2f | %.1e | %.4f | %.4f | %s | %s | %.3f | %s | %s | %s | %s |" % (
             r["spec"], r["ratio"], r["fidelity"]["rel_l2"], fe["kl_mean"], fe["ppl_ratio"],

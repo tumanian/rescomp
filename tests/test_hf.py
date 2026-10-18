@@ -1,191 +1,93 @@
-"""The Hugging Face path on a tiny random GPT-2: hooks, capture, evaluation, generation, CLI."""
+"""Hugging Face specifics: block discovery, header info, the hooked site equals hidden_states, MoE info."""
 import json
 
 import pytest
 import torch
 
 import rescomp as rc
-from rescomp import capture as C
-from rescomp import evaluate as E
 from rescomp import hf as H
+from rescomp import instrument as I
 from rescomp.cli import main
-from rescomp.hf import HFAdapter
 
 
-@pytest.fixture(scope="session")
-def toks():
-    return torch.randint(2, 256, (12, 16), generator=torch.Generator().manual_seed(0))
-
-
-@pytest.fixture(scope="session")
-def tiny(tiny_model, fake_tok):
-    return HFAdapter(tiny_model, fake_tok, model_id="tiny")
-
-
-def test_decoder_blocks_and_hook_names(tiny_model, tiny):
+def test_decoder_blocks_and_info(tiny_model, fake_tok):
     blocks, path = H.decoder_blocks(tiny_model)
     assert len(blocks) == 4 and path == "transformer.h"
-    assert tiny.hook_names(2) == {"hf": "transformer.h.2", "transformer_lens": "blocks.2.hook_resid_post"}
-    info = tiny.info()
-    assert info["n_layers"] == 4 and info["d_model"] == 64 and info["id"] == "tiny" and info["dtype"] == "float32"
-    assert info["config"]["n_head"] == 4 and info["loader"] == "transformers"
+    info = H.model_info(tiny_model, fake_tok, model_id="x/y")
+    assert info["n_layers"] == 4 and info["d_model"] == 64 and info["id"] == "x/y" and info["dtype"] == "float32"
+    assert info["config"]["n_head"] == 4 and info["loader"] == "transformers" and info["tokenizer"] == "fake"
     with pytest.raises(ValueError):
         H.decoder_blocks(torch.nn.Linear(2, 2))
-
-
-def test_capture_hook_matches_hidden_states(tiny_model, tiny, toks):
-    logits, acts, _ = tiny.forward(toks[:2], capture=[0, 2])
-    out = tiny_model(toks[:2], output_hidden_states=True)
-    # HF hidden_states[l + 1] is block l's output (the last one has the final norm applied, so we avoid it)
-    assert torch.equal(acts[0], out.hidden_states[1]) and torch.equal(acts[2], out.hidden_states[3])
-    assert torch.equal(logits, out.logits)
-
-
-def test_patch_hook_replaces_output(tiny, toks):
-    _, acts, _ = tiny.forward(toks[:2], capture=[1])
-    l1, _, _ = tiny.forward(toks[:2], patch={1: torch.zeros_like(acts[1])})
-    l2, _, _ = tiny.forward(toks[:2], patch={1: lambda t: t * 0})
-    l0, _, _ = tiny.forward(toks[:2])
-    assert torch.equal(l1, l2) and not torch.equal(l0, l1)
-
-
-def test_identity_patch_gives_zero_kl(tiny, toks):
-    k = E.identity_check(tiny, toks, [1, 2, 3], batch=5)
-    assert k["kl_mean"] == 0.0 and k["top1_agree"] == 1.0 and k["ppl_ratio"] == 1.0 and k["n_positions"] == 12 * 16
-
-
-def test_capture_file_and_evaluate(tiny, toks, tmp_path):
-    p = tmp_path / "t.rsc"
-    h = C.capture(tiny, toks, [1, 2, 3], "int4_g16+layerK3+out2", p, batch=5, calib_seqs=4,
-                  annotations={"doc": torch.arange(12)}, log=None)
-    assert h["capture"]["n_seq"] == 12 and h["capture"]["n_chunks"] == 3 and h["calib"]["source"] == "first 4 sequences"
-    with rc.Reader(p) as r:
-        assert r.layers == [1, 2, 3] and r.header["model"]["id"] == "tiny"
-        assert r.header["layers"][0]["hook"]["hf"] == "transformer.h.1"
-        assert torch.equal(r.tokens(), toks) and r.annotation("doc").tolist() == list(range(12))
-        _, acts, _ = tiny.forward(toks[:5], capture=[1, 2, 3])
-        X = torch.stack([acts[l] for l in (1, 2, 3)])
-        assert torch.equal(r.read_stack(seqs=slice(0, 5)), rc.encode(X, r.spec, r.calib)[1])
-        spec, calib = r.spec, r.calib
-    f = E.evaluate_file(p, tiny, batch=4)
-    assert f["mode"] == "file" and f["n_positions"] == 12 * 16 and 0 < f["kl_mean"] < 1 and 0 < f["top1_agree"] <= 1
-    assert f["ratio_vs_bf16"] > 1
-    lv = E.evaluate_live(tiny, toks, [1, 2, 3], spec, calib, batch=4)
-    assert lv["mode"] == "live" and 0 < lv["kl_mean"] < 1
-    per = E.evaluate_file_per_layer(p, tiny, batch=4, layers=[1, 3])
-    assert list(per) == [1, 3] and all(0 < v["kl_mean"] < 1 for v in per.values())
-    # lossless storage of an fp32 model gives KL 0 both ways
-    C.capture(tiny, toks, [1, 2, 3], "fp32", tmp_path / "f.rsc", batch=4, log=None)
-    assert E.evaluate_file(tmp_path / "f.rsc", tiny, batch=4)["kl_mean"] == 0.0
-    assert E.evaluate_live(tiny, toks, [1, 2, 3], "fp32", batch=4)["kl_mean"] == 0.0
-
-
-def test_capture_calibrates_on_exactly_calib_seqs(tiny, toks, tmp_path, monkeypatch):
-    seen = []
-    real = tiny.forward
-    monkeypatch.setattr(tiny, "forward", lambda tb, *a, **k: (seen.append(len(tb)), real(tb, *a, **k))[1])
-    C.capture(tiny, toks, [1, 2], "int4_g16+out2", tmp_path / "c.rsc", batch=5, calib_seqs=4, log=None)
-    assert seen[0] == 4 and sum(seen) == 4 + 12
-
-
-def test_more_damage_more_kl(tiny, toks):
-    kl = {s: E.evaluate_live(tiny, toks, [2, 3], s, batch=6)["kl_mean"] for s in ("fp16", "int8_tok", "int2_g16")}
-    assert kl["fp16"] < kl["int8_tok"] < kl["int2_g16"]
-
-
-def test_coherence(tiny, fake_tok):
-    out = E.coherence(tiny, ["hello world", [5, 6, 7]], [2, 3], "int4_g16+layerK2", tokenizer=fake_tok,
-                      n_new=6, seeds=2)
-    s = out["summary"]
-    assert s["n_pairs"] == 4 and len(out["records"]) == 4
-    r = out["records"][0]
-    assert len(r["clean"]["tokens"]) == 6 and len(r["codec"]["tokens"]) == 6 and isinstance(r["codec"]["text"], str)
-    assert r["prompt"] == "hello world" and out["records"][2]["prompt"] is None
-    assert abs(s["ppl_ratio"] - __import__("math").exp(s["log_ppl_diff"])) < 1e-9
-    # with no compression the paired difference is exactly zero
-    z = E.coherence(tiny, [[5, 6, 7]], [2, 3], "fp32", n_new=4, seeds=2)["summary"]
-    assert z["log_ppl_diff"] == 0.0 and z["t"] is None and z["n_prompts"] == 1
-
-
-def test_generate_is_seeded(tiny):
-    ids = torch.tensor([[3, 4, 5]])
-    a = E.generate(tiny, ids, 5, seed=1)
-    b = E.generate(tiny, ids, 5, seed=1)
-    c = E.generate(tiny, ids, 5, seed=2)
-    assert torch.equal(a, b) and a.shape == (1, 8) and not torch.equal(a, c)
-
-
-def test_ngram_stats():
-    s = E.ngram_stats([1, 2, 3, 4, 1, 2, 3, 4])
-    assert s["rep4"] == 1 / 5 and s["distinct2"] == 4 / 7
-    assert E.ngram_stats([]) == {"distinct2": 0.0, "rep4": 0.0}
-
-
-def test_pack_sequences(fake_tok):
-    t = C.pack_sequences(fake_tok, ["abcdef", "ghijkl", "mnop"], n_seq=2, seq_len=4)
-    assert t.shape == (2, 4) and t[0].tolist() == [ord(c) for c in "abcd"]
-    b = C.pack_sequences(fake_tok, ["abcdef", "ghijkl"], n_seq=2, seq_len=4, bos=True)
-    assert b[:, 0].tolist() == [0, 0] and b[0, 1:].tolist() == [ord(c) for c in "abc"]
+    L = H.hf_layers(tiny_model, [1, 3], fake_tok)
+    assert L.hook_names[3] == {"hf": "transformer.h.3", "transformer_lens": "blocks.3.hook_resid_post"}
     with pytest.raises(ValueError):
-        C.pack_sequences(fake_tok, ["ab"], n_seq=2, seq_len=4)
+        H.hf_layers(tiny_model, [9])
 
 
-def test_cli_info(tiny, toks, tmp_path, capsys):
-    p = tmp_path / "t.rsc"
-    C.capture(tiny, toks, [1, 3], "bf16", p, batch=6, log=None)
-    main(["info", str(p)])
+def test_hooked_site_is_hidden_states(tiny_model, fake_tok, tmp_path):
+    toks = torch.randint(2, 256, (3, 10))
+    with rc.Sink(str(tmp_path / "s"), rc.hf_layers(tiny_model, [0, 2], fake_tok), "fp32") as sink:
+        tiny_model(toks)
+    out = tiny_model(toks, output_hidden_states=True)
+    with rc.open(str(tmp_path / "s")) as r:
+        # HF hidden_states[l + 1] is block l's output (the last one has the final norm applied, so we avoid it)
+        assert torch.equal(torch.stack(r.read(0)), out.hidden_states[1])
+        assert torch.equal(torch.stack(r.read(2)), out.hidden_states[3])
+
+
+def test_moe_info(tiny_moe, fake_tok, tmp_path):
+    assert H.moe_layers(tiny_moe) == [0, 1]
+    toks = torch.randint(2, 64, (3, 6))
+    with rc.Sink(str(tmp_path / "moe"), rc.hf_layers(tiny_moe, [1], fake_tok), "fp16") as sink:
+        tiny_moe(toks)
+    with rc.open(str(tmp_path / "moe")) as r:
+        cfg = r.header["model"]["config"]
+        assert cfg["num_experts"] == 4 and cfg["num_experts_per_tok"] == 2 and cfg["moe_layers"] == [0, 1]
+        assert r.read(1, 0).shape == (6, 32)
+
+
+def test_hf_patcher_measurements(tiny_model, fake_tok):
+    L = rc.hf_layers(tiny_model, [1, 2, 3], fake_tok)
+    run = lambda t: tiny_model(t, use_cache=False).logits
+    t = torch.randint(2, 256, (6, 9), generator=torch.Generator().manual_seed(1))
+    assert I.kl_ppl(run, t, I.Patcher(L, lambda l, x, s, st: x), batch=3)["kl_mean"] == 0.0
+    kl = {s: I.kl_ppl(run, t, I.Patcher(L, I.LiveCodec(s)), batch=3)["kl_mean"] for s in ("fp16", "int8_tok", "int4_g16+layerK3")}
+    assert kl["fp16"] < kl["int8_tok"] < kl["int4_g16+layerK3"]
+
+
+def test_cli_info_and_eval(tiny_model, fake_tok, tmp_path, monkeypatch, capsys):
+    toks = torch.randint(2, 256, (8, 10), generator=torch.Generator().manual_seed(0))
+    stem = str(tmp_path / "c")
+    with rc.Sink(stem, rc.hf_layers(tiny_model, [1, 3], fake_tok, model_id="tiny"), "int4_g16+layerK2") as sink:
+        tiny_model(toks[:4])
+        tiny_model(toks[4:])
+    main(["info", stem])
     out = capsys.readouterr().out
-    assert "RSC1" in out and "layers [1, 3]" in out
-    main(["info", str(p), "--json"])
-    out = capsys.readouterr().out
-    assert '"spec": "bf16"' in out and "chunks" not in json.loads(out[out.index("{"):])
-
-
-def test_moe_routing_capture(tiny_moe, tiny, fake_tok, tmp_path):
-    moe = HFAdapter(tiny_moe, fake_tok, model_id="tiny-moe")
-    assert moe.moe_layers() == [0, 1] and tiny.moe_layers() == []
-    toks = torch.randint(2, 64, (6, 8), generator=torch.Generator().manual_seed(1))
-    logits, acts, routing = moe.forward(toks[:2], capture=[1], routers=[0, 1])
-    assert set(routing) == {0, 1} and routing[1]["experts"].shape == (2, 8, 2) and routing[1]["experts"].dtype == torch.int16
-    assert routing[1]["experts"].min() >= 0 and routing[1]["experts"].max() < 4
-    assert (routing[1]["experts"][..., 0] != routing[1]["experts"][..., 1]).all()      # top-2 are distinct experts
-    assert (routing[1]["weights"].float() > 0).all() and (routing[1]["weights"].float().sum(-1) <= 1.001).all()
-    h = C.capture(moe, toks, [1], "bf16", tmp_path / "moe.rsc", batch=4, routers="stored", log=None)
-    assert h["capture"]["extra"]["routers"] == {"layers": [1], "top_k": 2, "num_experts": 4}
-    assert h["model"]["config"]["moe_layers"] == [0, 1] and h["model"]["config"]["num_experts"] == 4
-    with rc.Reader(tmp_path / "moe.rsc") as r:
-        assert r.annotations == ["experts.1", "expert_weights.1"]
-        assert torch.equal(r.annotation("experts.1")[:2], routing[1]["experts"])
-        assert r.annotation("expert_weights.1").shape == (6, 8, 2)
-    with pytest.raises(ValueError):
-        C.capture(moe, toks, [1], "bf16", tmp_path / "x.rsc", routers=[5], log=None)
-    assert E.identity_check(moe, toks, [0, 1], batch=3)["kl_mean"] == 0.0
-
-
-def test_capture_calib_seqs_zero_uses_first_chunk(tiny, toks, tmp_path):
-    h = C.capture(tiny, toks, [1, 2], "int4_g16+out2", tmp_path / "c.rsc", batch=5, calib_seqs=0, log=None)
-    assert h["calib"]["source"] == "first_chunk" and h["capture"]["extra"]["calib_seqs"] == 0
-
-
-def test_cli_eval(tiny, toks, tmp_path, fake_tok, monkeypatch, capsys):
-    p = tmp_path / "t.rsc"
-    C.capture(tiny, toks, [1, 3], "int4_g16+layerK2", p, batch=6, log=None)
-    monkeypatch.setattr("rescomp.hf.load_model", lambda *a, **k: (tiny, fake_tok))
-    main(["eval", str(p), "--batch", "4", "--live", "--coherence", "--n-prompts", "1", "--n-new", "4", "--seeds", "2",
+    assert "RSC2" in out and "layers [1, 3]" in out
+    monkeypatch.setattr("rescomp.hf.load_model", lambda *a, **k: (tiny_model, fake_tok))
+    main(["eval", stem, "--batch", "4", "--live", "--coherence", "--n-prompts", "1", "--n-new", "4", "--seeds", "2",
           "--out", str(tmp_path / "e.json")])
-    out = json.loads((tmp_path / "e.json").read_text())
-    assert out["model"] == "tiny" and out["file_eval"]["layers"] == [3] and out["live_eval"]["layers"] == [1, 3]
-    assert out["coherence"]["n_pairs"] == 2
+    res = json.loads((tmp_path / "e.json").read_text())
+    assert res["model"] == "tiny" and 0 <= res["last_layer"]["kl_mean"] < 1 and res["live"]["n_seq"] == 8
+    assert res["coherence"]["n_pairs"] == 2
 
 
 def test_load_model_from_disk(tiny_model, tmp_path):
     from transformers import GPT2TokenizerFast
     tiny_model.save_pretrained(tmp_path / "m")
-    # a minimal tokenizer so AutoTokenizer can load from the same folder
     vocab = {chr(i): i for i in range(256)}
     (tmp_path / "m" / "vocab.json").write_text(json.dumps(vocab))
     (tmp_path / "m" / "merges.txt").write_text("#version: 0.2\n")
     GPT2TokenizerFast(str(tmp_path / "m" / "vocab.json"), str(tmp_path / "m" / "merges.txt")).save_pretrained(tmp_path / "m")
     model, tok = H.load_model(str(tmp_path / "m"), dtype="float32", device="cpu")
-    assert isinstance(model, HFAdapter) and hasattr(tok, "encode") and not model.model.training
-    assert model.info()["n_layers"] == 4
+    assert isinstance(model, torch.nn.Module) and hasattr(tok, "encode") and not model.training
+
+
+def test_pack_sequences(fake_tok):
+    from rescomp.data import pack_sequences
+    t = pack_sequences(fake_tok, ["abcdef", "ghijkl", "mnop"], n_seq=2, seq_len=4)
+    assert t.shape == (2, 4) and t[0].tolist() == [ord(c) for c in "abcd"]
+    b = pack_sequences(fake_tok, ["abcdef", "ghijkl"], n_seq=2, seq_len=4, bos=True)
+    assert b[:, 0].tolist() == [0, 0] and b[0, 1:].tolist() == [ord(c) for c in "abc"]
+    with pytest.raises(ValueError):
+        pack_sequences(fake_tok, ["ab"], n_seq=2, seq_len=4)

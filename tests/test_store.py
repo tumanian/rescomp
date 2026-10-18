@@ -47,7 +47,7 @@ def test_roundtrip(tmp_path):
     assert S.is_v2(stem) and not S.is_v2(str(tmp_path / "nope"))
     assert sorted(os.path.basename(p) for p in os.listdir(tmp_path)) == [
         "run.00000.rsc", "run.blobs.parquet", "run.chunks.parquet", "run.meta.parquet", "run.tokens.parquet"]
-    with S.Reader2(stem) as r:
+    with S.Reader(stem) as r:
         assert r.layers == LAYERS and r.n_seq == 10 and r.d == 64 and r.spec.name == "int4_g16+layerK2+out2"
         assert r.header["model"] == MODEL and r.header["extra"] == {"note": "x"}
         assert r.header["layers"][0]["hook"] == {"hf": "transformer.h.8"} and r.header["layers"][0]["outlier_channels"] == [5, 17]
@@ -76,7 +76,7 @@ def test_rotation(tmp_path):
     acts, tokens, expect = write_store(stem, rotate_bytes=4000)
     files = sorted(p for p in os.listdir(tmp_path) if p.endswith(".rsc"))
     assert len(files) > 1 and all(os.path.getsize(tmp_path / f) >= S.HEAD2 for f in files)
-    with S.Reader2(stem) as r:
+    with S.Reader(stem) as r:
         assert r.header["n_files"] == len(files)
         assert set(b["file"] for v in r.blobs.values() for b in v.values()) == set(range(len(files)))
         assert all(torch.equal(g, expect[3, i]) for i, g in enumerate(r.read(11)))
@@ -101,10 +101,10 @@ def test_sequence_spanning_chunks(tmp_path):
                     st.extend_sequence(ids[j], toks[j, a:b])
             parts.append(xh)
         st.flush()                                                      # readable before close
-        with S.Reader2(stem) as r:
+        with S.Reader(stem) as r:
             assert r.header["n_chunks"] == 4 and r.read(8, 0).shape == (6, 64)
     expect = torch.cat(parts, 2)
-    with S.Reader2(stem) as r:
+    with S.Reader(stem) as r:
         for l in LAYERS:
             for j in range(2):
                 assert torch.equal(r.read(l, j), expect[LAYERS.index(l), j])
@@ -127,7 +127,7 @@ def test_tokens_optional_and_ragged(tmp_path):
         streams, xh2 = rc.encode(X2, spec)
         st.add_chunk([b], [0], streams, err_rows(X2, xh2))
         st.note_raw(0, 64)
-    with S.Reader2(stem) as r:
+    with S.Reader(stem) as r:
         assert r.tokens(a) is None and r.tokens(b).tolist() == [1, 2, 3]
         assert r.sequences().column("n_tokens").to_pylist() == [5, 3]  # from chunks when no tokens
         padded, mask = r.read_padded(8)
@@ -152,27 +152,17 @@ def test_store_validation(tmp_path):
 def test_corruption_detected(tmp_path):
     stem = str(tmp_path / "c")
     write_store(stem)
-    with S.Reader2(stem) as r:
+    with S.Reader(stem) as r:
         rec = r.blobs[(1, 9)]["codes"]
     p = tmp_path / "c.00000.rsc"
     b = bytearray(p.read_bytes())
     b[rec["offset"] + 3] ^= 0xFF
     p.write_bytes(bytes(b))
-    with S.Reader2(stem) as r:
+    with S.Reader(stem) as r:
         r.read(9, 0)
         with pytest.raises(ValueError, match="crc"):
             r.read(9, 3)
 
-
-def test_open_dispatch(tmp_path):
-    stem = str(tmp_path / "v2")
-    write_store(stem)
-    assert isinstance(rc.open(stem), S.Reader2)
-    from tests.test_container import write_file
-    write_file(tmp_path / "v1.rsc", "bf16")
-    assert isinstance(rc.open(tmp_path / "v1.rsc"), rc.Reader)
-    with pytest.raises(ValueError):
-        rc.open(tmp_path / "missing")
 
 
 def test_parquet_schema(tmp_path):
@@ -185,3 +175,30 @@ def test_parquet_schema(tmp_path):
     assert b.num_rows == 3 * 4 * 3 and set(b.column("stream").to_pylist()) == {"codes", "scale0", "outliers"}
     c = pq.read_table(S.table_path(stem, "chunks"))
     assert c.column("n_seq").to_pylist() == [3, 5, 2] and c.column("seq_ids").to_pylist()[1] == [3, 4, 5, 6, 7]
+
+
+def test_open(tmp_path):
+    stem = str(tmp_path / "v2")
+    write_store(stem)
+    assert isinstance(rc.open(stem), rc.Reader)
+    with pytest.raises(ValueError):
+        rc.open(tmp_path / "missing")
+
+
+def test_transcode(tmp_path):
+    src, dst = str(tmp_path / "src"), str(tmp_path / "dst")
+    acts, tokens, _ = write_store(src, spec="fp32")
+    st = rc.transcode(src, dst, "int4_g16+layerK2+out2", calib_seqs=4)
+    assert st["chunks"] == 3 and st["ratio"] > 2
+    spec = rc.Spec.parse("int4_g16+layerK2+out2")
+    with rc.open(dst) as r:
+        assert r.spec == spec and r.header["extra"]["source_spec"] == "fp32" and r.n_seq == 10
+        assert torch.equal(torch.stack(r.tokens()), tokens) and r.annotation("doc_id") == [10 * i for i in range(10)]
+        assert r.header["calib"]["source"].startswith("first ")
+        for a, n in ((0, 3), (3, 5), (8, 2)):              # chunk-wise re-encoding with the file's own calibration
+            exp = rc.encode(acts[:, a: a + n], spec, r.calib)[1]
+            assert torch.equal(torch.stack(r.read(9, list(range(a, a + n)))), exp[1])
+    rc.transcode(src, str(tmp_path / "x"), "compact")
+    assert rc.open(str(tmp_path / "x")).spec.name == "int4_g8+layerK4+out8"
+    with pytest.raises(ValueError):
+        rc.Store(str(tmp_path / "z"), model=MODEL, layers=LAYERS).add_chunk([0], [0], [{}] * 4, None)

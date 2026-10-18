@@ -58,13 +58,13 @@ r.tokens(2); r.header["model"]; r.header["layers"][1]["fidelity"]
 default). `<stem>.meta.parquet` has the model, spec, calibration, stored layers with hook names and measured
 fidelity, and byte counts; `<stem>.chunks.parquet` which sequences each chunk holds and where; `<stem>.blobs.parquet`
 one row per blob (byte range, crc, dtype, shape); `<stem>.tokens.parquet` one row per sequence (tokens, mask,
-annotations). `rc.open()` also still reads the single-file RSC1 format from the earlier study.
+annotations).
 
 ### Lower level
 
 `rc.encode(X, spec, calib)` / `rc.decode(streams, spec, calib)` on an `[L, B, T, d]` stack; `rc.Encoder(...)
 .encode_layer(i, x)` one layer at a time (closed-loop deltas); `rc.Store` to write encoded chunks yourself;
-`rc.transcode(src, dst, spec)` to re-encode an RSC1 file.
+`rc.transcode(src, dst, spec)` to re-encode a stored capture with another spec or regime.
 
 ## Regimes
 
@@ -102,7 +102,7 @@ Anything beyond the four regimes is a spec string: `<quant>[+layerK<K>][+out<n>]
 |---|---|
 | `fp32`, `bf16`, `fp16` | plain casts (bf16 is lossless for a bf16 model; fp16 too, at 1.5×), then byte-shuffle + zstd |
 | `fp8_e4m3`, `int8_tok` | 8-bit codes with one fp16 scale per token |
-| `int4_g<G>`, `int2_g<G>`, `int8_g<G>` | torchao affine codes (symmetric, no clipping, full range) with one fp16 scale per group of G channels (G must divide d) |
+| `int4_g<G>`, `int8_g<G>` | torchao affine codes (symmetric, no clipping, full range) with one fp16 scale per group of G channels (G must divide d) |
 | `uabs<step>` | fixed step in activation units; zigzag integer codes in byte planes, so zstd does the entropy coding |
 | `mxfp4`, `nvfp4` | torchao's OCP MX / NVIDIA FP4: e2m1 codes with an e8m0 scale per 32 or an e4m3 scale per 16 channels |
 | `+layerK<K>` | code stored layer i as `x_i - xhat_{i-1}` except every K-th layer (closed loop, so errors do not accumulate) |
@@ -128,5 +128,5 @@ I.per_layer(run, tokens, L, I.LiveCodec("int8_tok+out8"))                       
 I.coherence(run, prompts, I.Patcher(L, I.LiveCodec(spec)), tokenizer=tok)       # generation, paired perplexity
 ```
 
-`rescomp.evaluate` and the `ModelAdapter` protocol (`rescomp.model`, `rescomp.hf.HFAdapter`) are the earlier,
-adapter-based versions of the same measurements; `scripts/run_models.py` still uses them for the study in RESULTS.md.
+`scripts/run_models.py` runs the study in RESULTS.md with these pieces (capture once with the `exact` regime,
+`rc.transcode` to each spec, then the measurements).

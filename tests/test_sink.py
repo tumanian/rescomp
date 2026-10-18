@@ -6,18 +6,12 @@ import rescomp as rc
 from rescomp.sink import Layers, Sink, extract_tokens_generic
 from tests.test_generic import D, L, V, ToyLM
 
-
-class ToyWithForward(ToyLM):
-    """forward(input_ids, attention_mask=None): what a pre-hook sees on a real model."""
-
-    def forward(self, input_ids, attention_mask=None, **kw):
-        logits, _ = self.run(input_ids, [], {})
-        return logits
+ToyWithForward = ToyLM
 
 
 @pytest.fixture(scope="module")
 def lm():
-    return ToyWithForward().eval()
+    return ToyLM().eval()
 
 
 def layers_of(lm, idx=(0, 1, 2)):
@@ -27,8 +21,7 @@ def layers_of(lm, idx=(0, 1, 2)):
 
 def reference(lm, toks, idx=(0, 1, 2)):
     """What the sink's encoder sees: the model's activations as they are."""
-    _, acts = lm.run(toks, list(idx), {})
-    return torch.stack([acts[l] for l in idx]).detach()
+    return lm.activations(toks, idx)
 
 
 def test_forward_calls_become_chunks(lm, tmp_path):

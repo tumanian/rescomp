@@ -10,8 +10,8 @@ A chunk is one encoded batch [L, B, T, d]: B sequences (ids `seq_ids`), each con
 its position `starts[i]`. A sequence may span several chunks (a prompt chunk, then one chunk per generated token);
 `Reader2.read` concatenates them. Chunks are encoded independently, so any chunk can be decoded alone.
 
-`Store` takes already-encoded streams (the Sink owns the encoder); `Reader2` decodes. `rescomp.open(stem)` picks
-this reader or the single-file RSC1 one.
+`Store` takes already-encoded streams (the Sink owns the encoder); `Reader` decodes; `transcode` re-encodes a
+stored capture with another spec without the model.
 """
 import json
 import os
@@ -27,14 +27,13 @@ import torch
 
 from . import lossless as LL
 from ._version import __version__
-from .codec import Calib, Decoder
+from .codec import Calib, Decoder, Encoder, calibrate
 from .quant import CODEC_VERSION
 from .spec import Spec
 
 MAGIC2 = b"RSC2"
 VERSION2 = 2
 HEAD2 = len(MAGIC2) + 4
-TABLES = ("meta", "chunks", "blobs", "tokens")
 
 
 def table_path(stem, name):
@@ -305,11 +304,11 @@ class Store:
 
 # ---------------------------------------------------------------- reader
 
-class Reader2:
+class Reader:
     def __init__(self, stem, verify=True):
         self.stem, self.verify = str(stem), verify
         if not is_v2(self.stem):
-            raise ValueError(f"{self.stem}: no {table_path(self.stem, 'meta')}")
+            raise ValueError(f"{self.stem}: no {table_path(self.stem, 'meta')} (a capture is opened by its stem)")
         m = pq.read_table(table_path(self.stem, "meta")).to_pylist()[0]
         self.meta = m
         self.header = dict(m, model=json.loads(m["model"]), calib=json.loads(m["calib"]), lossless=json.loads(m["lossless"]),
@@ -467,3 +466,48 @@ class Reader2:
         if self.annotations:
             lines.append("annotations: " + ", ".join(self.annotations))
         return "\n".join(lines)
+
+
+@torch.no_grad()
+def transcode(src, dst, spec, calib_seqs=32, level=3, rotate_bytes=4 << 30, extra=None):
+    """Re-encode a stored capture with another spec, chunk by chunk, without the model. Meant for a lossless
+    source (exact / bf16); the source spec and its measured error are recorded in the new header's extra.
+    Returns the new Store's stats."""
+    from .regimes import resolve
+    with Reader(src) as r:
+        spec = resolve(spec, r.d)
+        calib = None
+        if spec.outliers:
+            # calibrate on the chunks that hold the first calib_seqs sequences (chunks are rectangular)
+            chunks, seen = [], set()
+            for c in r.chunks:
+                if len(seen) >= calib_seqs:
+                    break
+                chunks.append(c["chunk"])
+                seen.update(c["seq_ids"])
+            sample = [torch.cat([r._decode_chunk(ci, i)[i].flatten(0, 1) for ci in chunks]) for i in range(len(r.layers))]
+            calib = calibrate(torch.stack(sample).unsqueeze(1), spec, source=f"first {len(seen)} sequences of {os.path.basename(src)}")
+        ex = dict(r.header["extra"])
+        ex.update({"transcoded_from": os.path.basename(src), "source_spec": r.spec.name,
+                   "source_rel_l2": r.header["fidelity"]["rel_l2"]}, **(extra or {}))
+        hooks = {l["layer"]: l["hook"] for l in r.header["layers"] if l.get("hook")}
+        with Store(dst, model=r.header["model"], layers=r.layers, spec=spec, calib=calib, site=r.header["site"],
+                   level=level, hook_names=hooks, extra=ex, rotate_bytes=rotate_bytes) as st:
+            for row in r.tokens_table.to_pylist():
+                sid = row["seq_id"]
+                new = st.new_sequence(row["tokens"], row["mask"], **{k: row[k] for k in r.annotations})
+                assert new == sid
+            enc = Encoder(spec, calib, len(r.layers))
+            for c in r.chunks:
+                ci = c["chunk"]
+                acts = [r._decode_chunk(ci, i)[i] for i in range(len(r.layers))]
+                enc.reset()
+                streams, err = [], []
+                for i, x in enumerate(acts):
+                    strm, xhat = enc.encode_layer(i, x)
+                    e = x - xhat
+                    err.append((float(e.pow(2).sum()), float(x.pow(2).sum()), float(e.abs().max())))
+                    streams.append(strm)
+                st.add_chunk(c["seq_ids"], c["starts"], streams, err)
+                st.note_raw(acts[0].numel() * 2 * len(acts), r.d)
+            return st.stats()

@@ -18,7 +18,6 @@ GOLDEN = {
     "int8_tok": "5318059e5631b454",
     "int8_g64": "c32d8916e4a6b450",          # d = 64, so one group per token: identical to int8_tok by construction
     "int4_g16": "75c70f3dcf8a568e",
-    "int2_g16": "d3ab19cff0eb1464",
     "uabs0.05": "bc01dd26eda27d43",
     "mxfp4": "4eaf361f495d21ec",
     "nvfp4": "1b1fcd5b7c7c2e68",

@@ -1,22 +1,24 @@
-"""rescomp: compress residual-stream activations and store them with the metadata interp work needs.
+"""rescomp: compress the residual-stream activations of a running model and keep them, with their metadata.
 
     import rescomp as rc
-    spec = rc.Spec.parse("int4_g384+layerK4+out12")
-    cal = rc.calibrate(x_sample, spec)                      # x_sample [L, N, T, d]
-    with rc.Writer("acts.rsc", model=info, layers=[8, 9, 10, 11], spec=spec, calib=cal) as w:
-        w.write(acts, tokens)                               # acts [L, B, T, d], tokens [B, T]; one call = one chunk
-    r = rc.Reader("acts.rsc")
-    r.read(layer=9, seqs=slice(0, 16))                      # [16, T, d] fp32, the encoder's own reconstruction
+    sink = rc.Sink("runs/x", layers=rc.hf_layers(model, [8, 9, 10, 11], tok), spec="balanced")
+    with sink:
+        model(**batch)                        # the model runs untouched; one forward call = one chunk
+    r = rc.open("runs/x")
+    r.read(9, seqs=[0, 1])                    # each sequence whole, fp32: the encoder's own reconstruction
 """
 from ._version import __version__
 from .spec import Spec
 from .codec import Calib, calibrate, Encoder, Decoder, encode, decode
-from .container import Writer, Reader, transcode, FORMAT, VERSION
-from .model import ModelAdapter, FunctionAdapter, TLAdapter
-from .store import Store, Reader2, is_v2
+from .store import Store, Reader, transcode, is_v2
 from .sink import Sink, Layers
 from .regimes import REGIMES, resolve as resolve_spec
-from .model import tl_layers
+from .tl import tl_layers
+
+
+def open(path, verify=True):
+    """Open a stored capture by its stem (<stem>.meta.parquet + <stem>.NNNNN.rsc)."""
+    return Reader(path, verify=verify)
 
 
 def hf_layers(model, layers, tokenizer=None, model_id=None, revision=None):
@@ -25,17 +27,5 @@ def hf_layers(model, layers, tokenizer=None, model_id=None, revision=None):
     return _hf(model, layers, tokenizer, model_id, revision)
 
 
-def open(path, verify=True):
-    """Open a stored capture: a format-2 stem (<stem>.meta.parquet + blob files) or a single RSC1 file."""
-    import os
-    path = str(path)
-    if is_v2(path):
-        return Reader2(path, verify=verify)
-    if os.path.isfile(path):
-        return Reader(path, verify=verify)
-    raise ValueError(f"{path}: neither a format-2 stem nor an RSC1 file")
-
-__all__ = ["Spec", "Calib", "calibrate", "Encoder", "Decoder", "encode", "decode",
-           "Writer", "Reader", "transcode", "FORMAT", "VERSION", "__version__",
-           "ModelAdapter", "FunctionAdapter", "TLAdapter", "Store", "Reader2", "is_v2", "open",
-           "Sink", "Layers", "hf_layers", "tl_layers", "REGIMES", "resolve_spec"]
+__all__ = ["Spec", "Calib", "calibrate", "Encoder", "Decoder", "encode", "decode", "Store", "Reader", "transcode",
+           "is_v2", "open", "Sink", "Layers", "hf_layers", "tl_layers", "REGIMES", "resolve_spec", "__version__"]

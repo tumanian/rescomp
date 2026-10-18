@@ -5,9 +5,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 PY=${PY:-$HOME/venv/bin/python}
-SPECS='int4_g{G8}+layerK4+out{O2} int4_g{G8}+layerK4+out{O2}+key=bf16 int4_g{G}+layerK4+out{O} int4_g{G}+layerK4+out{O}+key=bf16 uabs@0.1+out8 int8_tok+out8 bf16'
-COH='int4_g{G8}+layerK4+out{O2} int4_g{G8}+layerK4+out{O2}+key=bf16'
-PER='int4_g{G8}+layerK4+out{O2} int4_g{G8}+layerK4+out{O2}+key=bf16 int4_g{G}+layerK4+out{O} int4_g{G}+layerK4+out{O}+key=bf16 uabs@0.1+out8 int8_tok+out8'
+SPECS='compact balanced int4_g{G}+layerK4+out{O} int4_g{G}+layerK4+out{O}+key=bf16 uabs@0.1+out8 int8_tok+out8 bf16'
+COH='compact balanced'
+PER='compact balanced int4_g{G}+layerK4+out{O} int4_g{G}+layerK4+out{O}+key=bf16 uabs@0.1+out8 int8_tok+out8'
 
 run() { $PY scripts/run_models.py "$@" --specs $SPECS --coherence-specs $COH --per-layer-specs $PER; }
 run --model gpt2 --layers 8 9 10 11 --n-seq 128 --seq-len 256 --batch 16 --out results/gpt2

@@ -8,12 +8,13 @@ import rescomp as rc
 from rescomp import instrument as I
 from rescomp.sink import Layers, Sink
 from tests.test_generic import D, L, V
-from tests.test_sink import ToyWithForward, layers_of
+from tests.test_generic import ToyLM
+from tests.test_sink import layers_of
 
 
 @pytest.fixture(scope="module")
 def lm():
-    return ToyWithForward().eval()
+    return ToyLM().eval()
 
 
 @pytest.fixture(scope="module")
@@ -34,9 +35,9 @@ def test_identity_patch_is_exact(lm, toks):
 def test_live_codec_patcher(lm, toks):
     run = run_of(lm)
     kl = {}
-    for spec in ("fp16", "int8_tok", "int2_g16+layerK2"):
+    for spec in ("fp16", "int8_tok", "int4_g16+layerK2"):
         kl[spec] = I.kl_ppl(run, toks, I.Patcher(layers_of(lm), I.LiveCodec(spec)), batch=4)["kl_mean"]
-    assert kl["fp16"] < kl["int8_tok"] < kl["int2_g16+layerK2"]
+    assert kl["fp16"] < kl["int8_tok"] < kl["int4_g16+layerK2"]
     per = I.per_layer(run, toks, layers_of(lm), I.LiveCodec("int8_tok"), batch=4)
     assert list(per) == [0, 1, 2] and all(0 < v["kl_mean"] < 1 for v in per.values())
 
@@ -72,7 +73,7 @@ def test_store_backed_patcher_matches_live(lm, toks, tmp_path):
 
 
 def test_patcher_only_and_cleanup(lm, toks):
-    p = I.Patcher(layers_of(lm), I.LiveCodec("int2_g16"), only=[2])
+    p = I.Patcher(layers_of(lm), I.LiveCodec("int4_g16"), only=[2])
     assert p.order == [2]
     with p:
         a = lm(toks[:2])

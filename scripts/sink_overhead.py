@@ -41,17 +41,17 @@ def main():
     ap.add_argument("--dtype", default="bfloat16")
     a = ap.parse_args()
     model, tok = load_model(a.model, dtype=a.dtype)
-    dev = model.device
+    dev = model.get_input_embeddings().weight.device
     sync = torch.cuda.synchronize if dev.type == "cuda" else (lambda: None)
-    ids = torch.randint(2, model.model.config.vocab_size, (a.batch, a.seq_len), device=dev)
-    run = lambda: model.model(ids, use_cache=False)
+    ids = torch.randint(2, model.config.vocab_size, (a.batch, a.seq_len), device=dev)
+    run = lambda: model(ids, use_cache=False)
     with torch.no_grad():
         timed(run, 3, sync)                                           # warm-up
         clean = timed(run, a.iters, sync)
         res = {}
         for fid in (False, True):
             with tempfile.TemporaryDirectory() as d:
-                sink = rc.Sink(f"{d}/ov", rc.hf_layers(model.model, a.layers, tok), a.spec, buffer_bytes=1 << 40, fidelity=fid)
+                sink = rc.Sink(f"{d}/ov", rc.hf_layers(model, a.layers, tok), a.spec, buffer_bytes=1 << 40, fidelity=fid)
                 with sink:
                     timed(run, 3, sync)
                     hooked = timed(run, a.iters, sync)

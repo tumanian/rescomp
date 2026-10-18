@@ -2,7 +2,7 @@ import pytest
 import torch
 
 import rescomp as rc
-from rescomp.codec import Calib, Decoder, Encoder, stream_bytes
+from rescomp.codec import Calib, Decoder, Encoder
 from tests.conftest import ALL_SPECS, make_acts
 
 
@@ -40,7 +40,7 @@ def test_calibrate_finds_massive_channels(acts):
 
 
 def test_outliers_and_sink_are_exact_to_bf16(acts):
-    spec = rc.Spec.parse("int2_g16+out2+sink1")
+    spec = rc.Spec.parse("int4_g16+out2+sink1")
     cal = rc.calibrate(acts, spec)
     _, xh = rc.encode(acts, spec, cal)
     for c in (5, 17):
@@ -146,8 +146,3 @@ def test_works_on_bf16_input_and_other_batch_sizes():
     st, xh = rc.encode(x, spec, cal)
     assert torch.equal(rc.decode(st, spec, cal), xh)
 
-
-def test_stream_bytes_smaller_for_int4(acts):
-    s16 = stream_bytes(rc.encode(acts, "bf16")[0][0])
-    s4 = stream_bytes(rc.encode(acts, "int4_g16")[0][0])
-    assert s4 < s16 / 2

@@ -50,7 +50,7 @@ def test_fp8_bound(v):
     assert ((y - v).abs() <= v.abs() * 2 ** -4 + S[0].float() * 2 ** -6 + 1e-5).all()
 
 
-@pytest.mark.parametrize("q,bits", [("int8_g64", 8), ("int4_g16", 4), ("int2_g16", 2), ("int4_g64", 4)])
+@pytest.mark.parametrize("q,bits", [("int8_g64", 8), ("int4_g16", 4), ("int4_g64", 4)])
 def test_int_group_bound_and_packing(v, q, bits):
     y, c, S = roundtrip(v, q)
     G = Q.qinfo(q)["group"]
@@ -70,8 +70,6 @@ def test_pack_unpack():
     from torchao.prototype.mx_formats import kernels as mxk
     q = torch.randint(0, 16, (5, 32), dtype=torch.uint8)
     assert torch.equal(mxk.unpack_uint4(mxk.pack_uint4(q)), q)
-    q = torch.randint(0, 4, (5, 32), dtype=torch.uint8)
-    assert torch.equal(Q._unpack2(Q._pack2(q)), q)
 
 
 @pytest.mark.parametrize("step", [0.05, 0.5, 2.0])
@@ -94,7 +92,7 @@ def test_uabs_negative_values_zigzag():
 def test_fp4_bound(v, q):
     y, c, S = roundtrip(v, q)
     assert c.shape == (3, 7, 32) and c.dtype == torch.uint8
-    s = Q.fp4_scales(S, q)
+    s = (S[1].float() * S[0]).repeat_interleave(16, -1) if q == "nvfp4" else S[0].float().repeat_interleave(32, -1)
     # e2m1 grid spacing is at most 2 (between 4 and 6) in scaled units, so error <= 1 scale unit; mxfp4's power-of-two
     # scale puts the group max anywhere in [4, 8), so values above 6 clip (error up to 2 units); nvfp4's e4m3 block
     # scale rounds, so allow its 1/16 relative step on top
@@ -123,8 +121,7 @@ def test_check_dim():
         Q.check_dim("int4_g0", 64)
     with pytest.raises(ValueError):
         Q.check_dim("int4_g3", 9)        # 2 codes per byte: d must be even
-    with pytest.raises(ValueError):
-        Q.check_dim("int2_g3", 6)        # 4 codes per byte
+
 
 
 
