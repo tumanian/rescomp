@@ -7,7 +7,7 @@ name = "rescomp"
 version = "0.1.0"
 description = "Compress residual-stream activations and store them with the metadata interpretability work needs"
 requires-python = ">=3.10"
-dependencies = ["torch>=2.1", "numpy>=1.24", "zstandard>=0.21", "pyarrow>=15"]
+dependencies = ["torch>=2.8", "numpy>=1.24", "zstandard>=0.21", "pyarrow>=15", "torchao>=0.18"]
 
 [project.optional-dependencies]
 hf = ["transformers>=4.56", "datasets>=2.18"]   # 4.56: from_pretrained(dtype=)

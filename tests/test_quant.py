@@ -54,18 +54,24 @@ def test_fp8_bound(v):
 def test_int_group_bound_and_packing(v, q, bits):
     y, c, S = roundtrip(v, q)
     G = Q.qinfo(q)["group"]
-    assert S[0].shape == (3, 7, 64 // G, 1) and S[0].dtype == torch.float16
+    assert S[0].shape == (3, 7, 64 // G) and S[0].dtype == torch.float16
     assert c.shape == (3, 7, 64 * bits // 8)
-    step = S[0].float().expand(3, 7, 64 // G, G).reshape(3, 7, 64)
-    assert ((y - v).abs() <= step / 2 + 1e-4).all()
+    step = S[0].float().repeat_interleave(G, -1)
+    assert ((y - v).abs() <= step / 2 + 1e-3 * step).all()          # no clipping: every value within half a step
     assert c.dtype == (torch.int8 if bits == 8 else torch.uint8)
+    # the grid is torchao's: scale = max(-min / qmin, max / qmax) per group, then fp16
+    g = v.unflatten(-1, (-1, G))
+    qmin, qmax = Q.qinfo(q)["qmin"], Q.qinfo(q)["qmax"]
+    expect = torch.maximum(g.amin(-1) / qmin, g.amax(-1) / qmax).clamp(min=torch.finfo(torch.float32).eps).half()
+    assert torch.equal(S[0], expect)
 
 
 def test_pack_unpack():
+    from torchao.prototype.mx_formats import kernels as mxk
     q = torch.randint(0, 16, (5, 32), dtype=torch.uint8)
-    assert torch.equal(Q._unpack(Q._pack(q, 4), 4), q)
+    assert torch.equal(mxk.unpack_uint4(mxk.pack_uint4(q)), q)
     q = torch.randint(0, 4, (5, 32), dtype=torch.uint8)
-    assert torch.equal(Q._unpack(Q._pack(q, 2), 2), q)
+    assert torch.equal(Q._unpack2(Q._pack2(q)), q)
 
 
 @pytest.mark.parametrize("step", [0.05, 0.5, 2.0])
@@ -87,19 +93,23 @@ def test_uabs_negative_values_zigzag():
 @pytest.mark.parametrize("q", ["mxfp4", "nvfp4"])
 def test_fp4_bound(v, q):
     y, c, S = roundtrip(v, q)
-    G = Q.qinfo(q)["group"]
-    assert c.shape == (3, 7, 32)
-    s = Q._fp4_scale(S, q).expand(3, 7, 64 // G, G).reshape(3, 7, 64)
+    assert c.shape == (3, 7, 32) and c.dtype == torch.uint8
+    s = Q.fp4_scales(S, q)
     # e2m1 grid spacing is at most 2 (between 4 and 6) in scaled units, so error <= 1 scale unit; mxfp4's power-of-two
-    # scale puts the group max anywhere in [4, 8), so values above 6 clip (error up to 2 units)
-    assert ((y - v).abs() <= s * (2.0 if q == "mxfp4" else 1.0) + 1e-4).all()
+    # scale puts the group max anywhere in [4, 8), so values above 6 clip (error up to 2 units); nvfp4's e4m3 block
+    # scale rounds, so allow its 1/16 relative step on top
+    assert ((y - v).abs() <= s * (2.0 if q == "mxfp4" else 1.0 + 1 / 8) + 1e-4).all()
     assert ((y.abs()) <= s * 6 + 1e-4).all()
+    assert S[0].dtype == (torch.float8_e8m0fnu if q == "mxfp4" else torch.float32)
 
 
-def test_fp4_codes():
-    x = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.5, -6.0, 0.24, 0.26, 5.9, -2.6])
-    y = Q._fp4_decode(Q._fp4_encode(x))
-    assert torch.equal(y, torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.5, -6.0, 0.0, 0.5, 6.0, -3.0]))
+def test_fp4_matches_torchao_reference(v):
+    """mxfp4 decodes with torchao's own to_dtype; nvfp4 with its f4 table and scales."""
+    from torchao.prototype.mx_formats import mx_tensor
+    y, c, S = roundtrip(v, "mxfp4")
+    assert torch.equal(y, mx_tensor.to_dtype(c, S[0], Q.MX_ELEM, 32, torch.float32))
+    y, c, S = roundtrip(v, "nvfp4")
+    assert S[1].dtype == torch.float8_e4m3fn and S[1].shape == (3, 7, 4) and S[0].shape == (1,)
 
 
 def test_check_dim():
@@ -116,10 +126,6 @@ def test_check_dim():
     with pytest.raises(ValueError):
         Q.check_dim("int2_g3", 6)        # 4 codes per byte
 
-
-def test_mxfp4_scale_is_exact_power_of_two():
-    e = torch.arange(1, 255, dtype=torch.uint8).reshape(-1, 1)
-    assert torch.equal(Q._fp4_scale([e], "mxfp4"), torch.exp2(e.float() - 127))
 
 
 def test_qinfo_rejects_unknown():

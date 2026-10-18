@@ -12,7 +12,7 @@ the files afterwards.
 ## Install
 
 ```bash
-pip install -e .            # torch, numpy, zstandard, pyarrow
+pip install -e .            # torch>=2.8, numpy, zstandard, pyarrow, torchao
 pip install -e '.[hf]'      # + transformers, datasets
 pytest                      # ~210 tests, CPU only, under a minute
 ```
@@ -73,9 +73,9 @@ annotations). `rc.open()` also still reads the single-file RSC1 format from the 
 |---|---|
 | `fp32`, `bf16`, `fp16` | plain casts (bf16 is lossless for a bf16 model; fp16 too, at 1.5×), then byte-shuffle + zstd |
 | `fp8_e4m3`, `int8_tok` | 8-bit codes with one fp16 scale per token |
-| `int4_g<G>`, `int2_g<G>`, `int8_g<G>` | integer codes with one fp16 scale per group of G channels (G must divide d) |
+| `int4_g<G>`, `int2_g<G>`, `int8_g<G>` | torchao affine codes (symmetric, no clipping, full range) with one fp16 scale per group of G channels (G must divide d) |
 | `uabs<step>` | fixed step in activation units; zigzag integer codes in byte planes, so zstd does the entropy coding |
-| `mxfp4`, `nvfp4` | 4-bit floats with a shared block scale (32 or 16 channels) |
+| `mxfp4`, `nvfp4` | torchao's OCP MX / NVIDIA FP4: e2m1 codes with an e8m0 scale per 32 or an e4m3 scale per 16 channels |
 | `+layerK<K>` | code stored layer i as `x_i - xhat_{i-1}` except every K-th layer (closed loop, so errors do not accumulate) |
 | `+out<n>` | keep the n highest-energy channels of each layer in bf16 (calibrated; stored in the header) |
 | `+sink<s>` | keep the first s tokens of every sequence in bf16 |

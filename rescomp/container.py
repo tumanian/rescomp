@@ -33,6 +33,7 @@ import torch
 
 from . import lossless as LL
 from . import quant as Q
+from .quant import CODEC_VERSION
 from ._version import __version__
 from .codec import Calib, Decoder, Encoder, calibrate
 from .spec import Spec
@@ -204,7 +205,7 @@ class Writer:
                              "max_abs": float(self.maxabs[i])}})
         total = float(self.ss.sum())
         return {
-            "format": FORMAT.decode(), "version": VERSION, "library": f"rescomp {__version__}",
+            "format": FORMAT.decode(), "version": VERSION, "codec": CODEC_VERSION, "library": f"rescomp {__version__}",
             "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "model": self.model,
             "capture": {"site": self.site, "seq_len": self.seq_len, "n_seq": self.n_seq, "d_model": self.d,
@@ -298,6 +299,9 @@ class Reader:
         self.header = json.loads(raw)
         if self.header.get("version", 0) > VERSION:
             raise ValueError(f"file version {self.header['version']} is newer than this library ({VERSION})")
+        if self.header.get("codec", 1) != CODEC_VERSION:
+            raise ValueError(f"{self.path}: codec version {self.header.get('codec', 1)} (this library decodes "
+                             f"{CODEC_VERSION}; version 1 files were written with the pre-torchao quantizers)")
         self.spec = Spec.parse(self.header["spec"])
         self.calib = Calib.from_dict(self.header["calib"])
         self.layers = [l["layer"] for l in self.header["layers"]]

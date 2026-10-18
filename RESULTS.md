@@ -6,6 +6,10 @@ and `scripts/report.py`; the raw records (`results/<model>/results.jsonl`, gener
 
 ## Setup
 
+*Codec note: these numbers were measured with codec version 1 (the library's own quantizers). Codec version 2
+pins the int-group, MXFP4 and NVFP4 paths to torchao; its int grid is torchao's no-clipping symmetric one, which
+matches version 1 on this kind of data (see `tests/test_quant.py`), so ratios and errors carry over within noise.*
+
 - **Models** (bf16, Hugging Face): GPT-2 small (12 layers, d = 768), Qwen3-1.7B (28 layers, d = 2048),
   Gemma-2-2B (26 layers, d = 2304, eager attention, BOS-first windows), Qwen3-8B (36 layers, d = 4096); then, as
   additions, Qwen3-14B (40 layers, d = 5120), Gemma-2-9B (42 layers, d = 3584), OLMoE-1B-7B (16 layers, d = 2048,

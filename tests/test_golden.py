@@ -1,5 +1,6 @@
 """Encoded bytes and reconstructions are pinned: a refactor that changes any codec's output fails here.
-Regenerate GOLDEN only for a deliberate format change (and bump the container VERSION if files are affected)."""
+Regenerate GOLDEN only for a deliberate format change (and bump quant.CODEC_VERSION).
+Codec 2 (2026-10-18): int groups, mxfp4 and nvfp4 moved to torchao; those hashes changed, the rest did not."""
 import hashlib
 
 import pytest
@@ -15,16 +16,16 @@ GOLDEN = {
     "fp16": "5afb98eea76b5372",
     "fp8_e4m3": "f7c49abac3b36280",
     "int8_tok": "5318059e5631b454",
-    "int8_g64": "5318059e5631b454",          # d = 64, so one group per token: identical to int8_tok by construction
-    "int4_g16": "6feddde8084cdad6",
-    "int2_g16": "51b7ceb67bfa504c",
+    "int8_g64": "c32d8916e4a6b450",          # d = 64, so one group per token: identical to int8_tok by construction
+    "int4_g16": "75c70f3dcf8a568e",
+    "int2_g16": "d3ab19cff0eb1464",
     "uabs0.05": "bc01dd26eda27d43",
-    "mxfp4": "6fcc54219b5f905d",
-    "nvfp4": "2654e3c889b87d3d",
-    "int4_g16+layerK2": "c140e9302815d3dc",
-    "int4_g16+layerK4+out4": "d4b57f5247e4d766",
-    "int4_g16+layerK2+out4+sink1": "bf6e73fd975635d2",   # changed 2026-10-17: calibration ignores sink rows
-    "int4_g16+layerK4+out2+key=bf16": "e479a7a6ebe3a847",
+    "mxfp4": "4eaf361f495d21ec",
+    "nvfp4": "1b1fcd5b7c7c2e68",
+    "int4_g16+layerK2": "bef1b603af6728a1",
+    "int4_g16+layerK4+out4": "67d3f6916793ce14",
+    "int4_g16+layerK2+out4+sink1": "d35af5d6ebb89afa",   # changed 2026-10-17: calibration ignores sink rows
+    "int4_g16+layerK4+out2+key=bf16": "ad5c7d7be787e07d",
     "uabs0.1+out8": "5b3ca28fff654d60",
     "bf16+sink2": "17586e36166629b2",
     "fp16+layerK3+key=fp32": "ae6088d73489f3bb",

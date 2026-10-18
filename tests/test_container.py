@@ -288,13 +288,14 @@ def test_transcode_keeps_attention_mask(tmp_path):
 
 
 def test_format_fixture():
-    """A file written by rescomp 0.1.0 (tests/data/fixture_v1.rsc) must keep reading back the same values: a
+    """A file written by rescomp 0.1.0 with codec 2 (tests/data/fixture_rsc1_codec2.rsc) must keep reading back the same values: a
     self-consistent change to the byte layout, header names or shuffle would otherwise go unnoticed."""
     import hashlib
     from pathlib import Path
-    p = Path(__file__).parent / "data" / "fixture_v1.rsc"
+    p = Path(__file__).parent / "data" / "fixture_rsc1_codec2.rsc"
     with rc.Reader(p) as r:
-        assert r.header["version"] == 1 and r.spec.name == "int4_g16+layerK2+out2" and r.layers == [8, 9, 10, 11]
+        assert r.header["version"] == 1 and r.header["codec"] == 2
+        assert r.spec.name == "int4_g16+layerK2+out2" and r.layers == [8, 9, 10, 11]
         assert r.n_seq == 5 and r.seq_len == 8 and r.d == 64 and r.n_chunks == 2
         assert r.header["model"]["id"] == "test/tiny" and r.annotations == ["doc_id"]
         assert r.header["layers"][0]["outlier_channels"] == [5, 17]
@@ -304,7 +305,7 @@ def test_format_fixture():
         assert h.hexdigest()[:16] == FIXTURE_DIGEST
 
 
-FIXTURE_DIGEST = "57f8eb051c13049b"
+FIXTURE_DIGEST = "a2ffcbe6cea7f77b"
 
 
 def test_unclosed_file_refused(tmp_path):
@@ -348,6 +349,19 @@ def test_not_an_rsc_file(tmp_path):
         rc.Reader(p)
     p.write_bytes(FORMAT + struct.pack("<QQ", 20, 10) + b"\0" * 4)
     with pytest.raises(ValueError, match="truncated"):
+        rc.Reader(p)
+
+
+def test_old_codec_refused(tmp_path):
+    p = tmp_path / "a.rsc"
+    write_file(p, "bf16")
+    b = bytearray(p.read_bytes())
+    off, n = struct.unpack("<QQ", b[len(FORMAT): HEAD])
+    h = json.loads(bytes(b[off: off + n]))
+    h["codec"] = 1
+    nh = json.dumps(h).encode()
+    p.write_bytes(bytes(b[:len(FORMAT)]) + struct.pack("<QQ", off, len(nh)) + bytes(b[HEAD:off]) + nh)
+    with pytest.raises(ValueError, match="codec version 1"):
         rc.Reader(p)
 
 

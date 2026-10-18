@@ -28,6 +28,7 @@ import torch
 from . import lossless as LL
 from ._version import __version__
 from .codec import Calib, Decoder
+from .quant import CODEC_VERSION
 from .spec import Spec
 
 MAGIC2 = b"RSC2"
@@ -212,7 +213,7 @@ class Store:
                                 "max_abs": float(self.maxabs[i])}} for i, l in enumerate(self.layers)]
         total = float(self.ss.sum())
         n_tok = sum(c["n_tokens"] * c["n_seq"] for c in self.chunk_rows)
-        return {"format": MAGIC2.decode(), "version": VERSION2, "library": f"rescomp {__version__}",
+        return {"format": MAGIC2.decode(), "version": VERSION2, "codec": CODEC_VERSION, "library": f"rescomp {__version__}",
                 "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "model": json.dumps(self.model), "spec": self.spec.name,
                 "calib": json.dumps((self.calib or Calib(None, "none")).to_dict()),
                 "lossless": json.dumps({"codec": "zstd", "level": self.level, "shuffle": self.shuffle}),
@@ -296,6 +297,8 @@ class Reader2:
                            bytes=json.loads(m["bytes"]))
         if m["version"] > VERSION2:
             raise ValueError(f"file version {m['version']} is newer than this library ({VERSION2})")
+        if m.get("codec", 1) != CODEC_VERSION:
+            raise ValueError(f"{self.stem}: codec version {m.get('codec', 1)}; this library decodes {CODEC_VERSION}")
         self.spec = Spec.parse(m["spec"])
         self.calib = Calib.from_dict(self.header["calib"])
         self.layers = [l["layer"] for l in self.header["layers"]]
