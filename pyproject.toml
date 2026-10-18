@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rescomp"
+version = "0.1.0"
+description = "Compress residual-stream activations and store them with the metadata interpretability work needs"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.1", "numpy>=1.24", "zstandard>=0.21"]
+
+[project.optional-dependencies]
+hf = ["transformers>=4.56", "datasets>=2.18"]   # 4.56: from_pretrained(dtype=)
+test = ["pytest>=7", "pytest-cov", "transformers>=4.56"]
+
+[project.scripts]
+rescomp = "rescomp.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["rescomp*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
