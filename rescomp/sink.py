@@ -1,6 +1,6 @@
 """The Sink: hooks on a running model, activations flow into a format-2 store. The model is not wrapped.
 
-    sink = Sink("runs/run1", layers=hf_layers(model, [8, 9, 10, 11]), spec="int4_g384+layerK4+out12")
+    sink = Sink("runs/run1", layers=hf_layers(model, [8, 9, 10, 11]), spec="balanced")   # a regime or a spec string
     with sink:
         model(**batch)              # one forward call = one chunk
         model.generate(**prompt)    # each step = one chunk; the reader returns the sequence whole
@@ -27,6 +27,7 @@ from typing import Callable, Dict, Optional
 import torch
 
 from .codec import Encoder, calibrate
+from .regimes import is_regime, needs_width, resolve
 from .spec import Spec
 from .store import Store
 
@@ -67,16 +68,20 @@ def _first(o):
 
 class Sink:
     def __init__(self, stem, layers, spec, *, tokens=None, calib=None, buffer_bytes=2 << 30, rotate_bytes=4 << 30,
-                 level=3, site="resid_post", extra=None, model_info=None):
+                 level=3, site="resid_post", extra=None, model_info=None, fidelity=False):
+        """fidelity=True also measures each layer's reconstruction error in the hook (an extra reconstruction
+        and three reductions per layer, in fp32): useful once, costly on every forward."""
         if tokens not in (None, "off"):
             raise ValueError("tokens must be None (pre-hook) or 'off'")
-        self.spec = Spec.parse(spec)
+        self._spec_arg = spec
+        self.spec = None if needs_width(spec) else resolve(spec)     # regimes resolve on the first call (need d)
         L = layers if isinstance(layers, Layers) else Layers(modules=dict(layers))
         self.layers = L
         self.order = sorted(int(l) for l in L.modules)
         if not self.order:
             raise ValueError("no layers to hook")
         self.record_tokens = tokens is None
+        self.fidelity = fidelity
         self.calib = calib
         self.buffer_bytes, self.site = buffer_bytes, site
         info = dict(L.model_info)
@@ -84,6 +89,7 @@ class Sink:
         info.setdefault("n_layers", L.n_layers)
         self.store = Store(stem, model=info, layers=self.order, spec=self.spec, calib=calib, site=site, level=level,
                            hook_names=L.hook_names, extra=dict(extra or {}), rotate_bytes=rotate_bytes)
+        self.store.regime = spec if is_regime(spec) else None
         self.enc = None
         self._handles = []
         self._call = None                 # the forward call being observed: {"acts", "ids", "mask", "cont"}
@@ -218,6 +224,9 @@ class Sink:
     # -- encoding (in the hook, on the model's device)
     def _encoder(self, acts):
         if self.enc is None:
+            if self.spec is None:
+                self.spec = resolve(self._spec_arg, acts[0].shape[-1])
+                self.store.set_spec(self.spec)
             if self.calib is None and self.spec.outliers:
                 self.calib = calibrate(torch.stack([a.float() for a in acts]), self.spec, source="first_chunk")
             if self.spec.outliers:
@@ -240,18 +249,19 @@ class Sink:
         enc = self._encoder(acts)
         streams, err = [], []
         for i, x in enumerate(acts):
-            st, xhat = enc.encode_layer(i, x)
-            xf = x.float()
-            e = xf - xhat
-            # error statistics stay on the device as 0-d tensors: reducing them here would synchronize
-            err.append(torch.stack([e.double().pow(2).sum(), xf.double().pow(2).sum(), e.abs().max().double()]))
+            st, xhat = enc.encode_layer(i, x, reconstruct=self.fidelity)
+            if self.fidelity:
+                xf = x.float()
+                e = xf - xhat
+                # fp32 and kept on the device as a 0-d tensor: reducing to Python here would synchronize
+                err.append(torch.stack([e.pow(2).sum(), xf.pow(2).sum(), e.abs().max()]))
             streams.append({k: self._to_host(t) for k, t in st.items()})
         dev = acts[0].device
         event = None
         if dev.type == "cuda":
             event = torch.cuda.Event()
             event.record(torch.cuda.current_stream(dev))
-        self._buffer.append((list(seq_ids), list(starts), streams, torch.stack(err), event))
+        self._buffer.append((list(seq_ids), list(starts), streams, torch.stack(err) if err else None, event))
         self._buffered += sum(t.numel() * t.element_size() for st in streams for t in st.values())
 
     def _write_buffer(self):
@@ -259,5 +269,5 @@ class Sink:
         for seq_ids, starts, streams, err, event in self._buffer:
             if event is not None:
                 event.synchronize()
-            self.store.add_chunk(seq_ids, starts, streams, err.cpu().tolist())
+            self.store.add_chunk(seq_ids, starts, streams, None if err is None else err.cpu().tolist())
         self._buffer, self._buffered = [], 0

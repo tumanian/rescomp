@@ -174,3 +174,29 @@ def test_bad_args(lm, tmp_path):
         sink.annotate(doc=[1, 2, 3])
         with pytest.raises(ValueError):
             lm(torch.randint(0, V, (2, 4)))
+
+
+@pytest.mark.parametrize("regime,expect", [("exact", "fp16"), ("faithful", "int8_tok+out8"),
+                                           ("balanced", "int4_g4+layerK4+out8+key=bf16"), ("compact", "int4_g4+layerK4+out8")])
+def test_regimes_resolve_on_first_call(lm, tmp_path, regime, expect):
+    toks = torch.randint(0, V, (3, 6))
+    with Sink(str(tmp_path / regime), layers_of(lm), regime) as sink:
+        assert sink.spec is None
+        lm(toks)
+        assert sink.spec.name == expect                     # d = 32: groups of 4, at least 8 outliers
+    with rc.open(str(tmp_path / regime)) as r:
+        assert r.spec.name == expect and r.regime == regime and r.n_seq == 3
+        assert f"(regime {regime})" in r.summary()
+
+
+def test_regime_helpers():
+    from rescomp.regimes import resolve, needs_width, REGIMES
+    assert set(REGIMES) == {"exact", "faithful", "balanced", "compact"}
+    assert resolve("compact", 4096).name == "int4_g512+layerK4+out32"
+    assert resolve("balanced", 768).name == "int4_g96+layerK4+out8+key=bf16"
+    assert resolve("int4_g{G}+out{O}", 768).name == "int4_g384+out12"
+    assert resolve("bf16").name == "bf16" and not needs_width("bf16") and needs_width("compact")
+    with pytest.raises(ValueError):
+        resolve("compact")
+    with pytest.raises(ValueError):
+        resolve("nonsense")

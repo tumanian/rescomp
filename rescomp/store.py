@@ -129,23 +129,26 @@ def _from_arrow(value):
 class Store:
     """Format-2 writer. Give it encoded chunks and per-sequence tokens; call flush() to make the files readable."""
 
-    def __init__(self, stem, *, model, layers, spec, calib=None, site="resid_post", level=3, shuffle=True,
+    def __init__(self, stem, *, model, layers, spec=None, calib=None, site="resid_post", level=3, shuffle=True,
                  hook_names=None, extra=None, rotate_bytes=4 << 30):
+        """spec may be None at construction (a regime that needs the model width) and set with set_spec()
+        before the first chunk."""
         self.stem = str(stem)
-        self.spec = Spec.parse(spec)
+        self.spec = None if spec is None else Spec.parse(spec)
         self.layers = [int(l) for l in layers]
         if not self.layers or self.layers != sorted(set(self.layers)):
             raise ValueError("layers must be a non-empty, strictly increasing list")
-        self.calib = calib if self.spec.outliers else None
-        if self.calib is not None:
-            self.calib.check(self.spec, len(self.layers))
+        self.calib = calib
+        self.chunk_rows, self.blob_rows = [], []
+        if self.spec is not None:
+            self.set_spec(self.spec)
         self.model, self.site, self.level, self.shuffle = dict(model), site, level, shuffle
         self.hook_names = {str(k): v for k, v in (hook_names or {}).items()}
         self.extra = dict(extra or {})
+        self.regime = None               # the regime name this spec came from, if any
         json.dumps({"model": self.model, "hook_names": self.hook_names, "extra": self.extra})
         os.makedirs(os.path.dirname(os.path.abspath(self.stem)), exist_ok=True)
         self.blobs = BlobFiles(self.stem, rotate_bytes, level, shuffle)
-        self.chunk_rows, self.blob_rows = [], []
         self.seq = {}                    # seq_id -> {"tokens": list[int] | None, "mask": list[int] | None, "ann": {}}
         self.d = None
         L = len(self.layers)
@@ -153,8 +156,18 @@ class Store:
         self.ss = np.zeros(L)
         self.maxabs = np.zeros(L)
         self.act_raw = self.act_stored = 0
+        self.n_measured = 0              # chunks whose reconstruction error was measured
         self.t0 = time.time()
         self.closed = False
+
+    def set_spec(self, spec):
+        if self.chunk_rows:
+            raise ValueError("spec cannot change after the first chunk")
+        self.spec = Spec.parse(spec)
+        if not self.spec.outliers:
+            self.calib = None
+        elif self.calib is not None:
+            self.calib.check(self.spec, len(self.layers))
 
     # -- sequences
     def new_sequence(self, tokens=None, mask=None, **annotations):
@@ -180,6 +193,8 @@ class Store:
         (sum of squared error, sum of squares, max abs error) for the fidelity record. Returns the chunk id."""
         if self.closed:
             raise ValueError("store is closed")
+        if self.spec is None:
+            raise ValueError("set_spec() before the first chunk")
         if len(streams) != len(self.layers):
             raise ValueError(f"got {len(streams)} layers, store has {len(self.layers)}")
         T = int(streams[0]["codes"].shape[-2] if streams[0]["codes"].dim() >= 3 else 0)
@@ -192,10 +207,12 @@ class Store:
         B = len(seq_ids)
         self.chunk_rows.append({"chunk": cid, "seq_ids": [int(s) for s in seq_ids], "starts": [int(s) for s in starts],
                                 "n_tokens": T, "n_seq": B})
-        err = np.asarray(err, dtype=np.float64).reshape(len(self.layers), 3)
-        self.sse += err[:, 0]
-        self.ss += err[:, 1]
-        self.maxabs = np.maximum(self.maxabs, err[:, 2])
+        if err is not None:
+            err = np.asarray(err, dtype=np.float64).reshape(len(self.layers), 3)
+            self.sse += err[:, 0]
+            self.ss += err[:, 1]
+            self.maxabs = np.maximum(self.maxabs, err[:, 2])
+            self.n_measured += 1
         return cid
 
     def note_raw(self, nbytes_bf16, d):
@@ -205,21 +222,24 @@ class Store:
 
     # -- tables
     def _meta(self):
-        layers = [{"index": i, "layer": l, "site": f"{self.site}.{l}", "quant": self.spec.quant_for(i),
-                   "keyframe": self.spec.is_key(i),
+        spec = self.spec or Spec("bf16")
+        layers = [{"index": i, "layer": l, "site": f"{self.site}.{l}", "quant": spec.quant_for(i),
+                   "keyframe": spec.is_key(i),
                    "outlier_channels": self.calib.outliers[i].tolist() if self.calib is not None else None,
                    "hook": self.hook_names.get(str(l)),
-                   "fidelity": {"rel_l2": float(np.sqrt(self.sse[i] / self.ss[i])) if self.ss[i] > 0 else 0.0,
-                                "max_abs": float(self.maxabs[i])}} for i, l in enumerate(self.layers)]
+                   "fidelity": {"rel_l2": float(np.sqrt(self.sse[i] / self.ss[i])) if self.ss[i] > 0 else None,
+                                "max_abs": float(self.maxabs[i]) if self.n_measured else None}} for i, l in enumerate(self.layers)]
         total = float(self.ss.sum())
         n_tok = sum(c["n_tokens"] * c["n_seq"] for c in self.chunk_rows)
         return {"format": MAGIC2.decode(), "version": VERSION2, "codec": CODEC_VERSION, "library": f"rescomp {__version__}",
-                "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "model": json.dumps(self.model), "spec": self.spec.name,
+                "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "model": json.dumps(self.model),
+                "spec": self.spec.name if self.spec else None, "regime": self.regime,
                 "calib": json.dumps((self.calib or Calib(None, "none")).to_dict()),
                 "lossless": json.dumps({"codec": "zstd", "level": self.level, "shuffle": self.shuffle}),
                 "site": self.site, "d_model": self.d, "layers": json.dumps(layers),
-                "fidelity": json.dumps({"rel_l2": float(np.sqrt(self.sse.sum() / total)) if total > 0 else 0.0,
-                                        "max_abs": float(self.maxabs.max())}),
+                "fidelity": json.dumps({"rel_l2": float(np.sqrt(self.sse.sum() / total)) if total > 0 else None,
+                                        "max_abs": float(self.maxabs.max()) if self.n_measured else None,
+                                        "measured_chunks": self.n_measured}),
                 "extra": json.dumps(self.extra), "n_sequences": len(self.seq), "n_chunks": len(self.chunk_rows),
                 "n_tokens": int(n_tok), "n_files": len(self.blobs.files),
                 "bytes": json.dumps({"activations_raw_bf16": self.act_raw, "activations_stored": self.act_stored,
@@ -266,7 +286,7 @@ class Store:
         return {"sequences": m["n_sequences"], "chunks": m["n_chunks"], "tokens": m["n_tokens"],
                 "bytes_raw_bf16": self.act_raw, "bytes_stored": self.act_stored,
                 "ratio": (self.act_raw / self.act_stored) if self.act_stored else None,
-                "rel_l2": {l: float(np.sqrt(self.sse[i] / self.ss[i])) if self.ss[i] > 0 else 0.0
+                "rel_l2": {l: float(np.sqrt(self.sse[i] / self.ss[i])) if self.ss[i] > 0 else None
                            for i, l in enumerate(self.layers)}, "files": self.blobs.files}
 
     def close(self):
@@ -300,6 +320,7 @@ class Reader2:
         if m.get("codec", 1) != CODEC_VERSION:
             raise ValueError(f"{self.stem}: codec version {m.get('codec', 1)}; this library decodes {CODEC_VERSION}")
         self.spec = Spec.parse(m["spec"])
+        self.regime = m.get("regime")
         self.calib = Calib.from_dict(self.header["calib"])
         self.layers = [l["layer"] for l in self.header["layers"]]
         self.d = m["d_model"]
@@ -434,12 +455,15 @@ class Reader2:
                  f"model: {m.get('id')} rev {m.get('revision')} n_layers={m.get('n_layers')} d_model={m.get('d_model')}",
                  f"stored: {h['n_sequences']} sequences, {h['n_tokens']} tokens, {h['n_chunks']} chunks in {h['n_files']} "
                  f"blob file(s); layers {self.layers}; site {h['site']}",
-                 f"spec: {h['spec']}   lossless: zstd-{h['lossless']['level']}{' + byte shuffle' if self.shuffle else ''}",
+                 f"spec: {h['spec']}{' (regime ' + h['regime'] + ')' if h.get('regime') else ''}   lossless: zstd-{h['lossless']['level']}{' + byte shuffle' if self.shuffle else ''}",
                  f"bytes: {b['activations_stored']:,} stored / {b['activations_raw_bf16']:,} raw bf16 = {ratio}",
-                 f"fidelity: rel L2 {h['fidelity']['rel_l2']:.3e}, max abs err {h['fidelity']['max_abs']:.3g}"]
+                 ("fidelity: not measured (Sink(fidelity=True) measures it)" if h["fidelity"]["rel_l2"] is None else
+                  f"fidelity: rel L2 {h['fidelity']['rel_l2']:.3e}, max abs err {h['fidelity']['max_abs']:.3g}")]
         for l in h["layers"]:
+            f = l["fidelity"]["rel_l2"]
             lines.append(f"  layer {l['layer']:3d} {l['quant']:10s} {'key' if l['keyframe'] else 'delta':5s} "
-                         f"rel L2 {l['fidelity']['rel_l2']:.3e}" + (f" outliers {l['outlier_channels']}" if l["outlier_channels"] else ""))
+                         + (f"rel L2 {f:.3e}" if f is not None else "rel L2 -")
+                         + (f" outliers {l['outlier_channels']}" if l["outlier_channels"] else ""))
         if self.annotations:
             lines.append("annotations: " + ", ".join(self.annotations))
         return "\n".join(lines)

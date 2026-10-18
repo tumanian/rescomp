@@ -115,9 +115,11 @@ class Encoder(_Walker):
     """Call encode_layer(i, x) for i = 0, 1, ..., in order within one chunk (keyframes may be coded alone)."""
 
     @torch.no_grad()
-    def encode_layer(self, i, x):
+    def encode_layer(self, i, x, reconstruct=True):
         """x [B, T, d] -> (streams: name -> tensor on x's device, xhat fp32 [B, T, d]).
-        xhat is also the reference for the next delta layer: do not modify it in place."""
+        xhat is also the reference for the next delta layer: do not modify it in place.
+        reconstruct=False skips the dequantization when no delta layer follows and the caller does not need
+        xhat (returns None); a delta layer always reconstructs."""
         if x.dim() != 3:
             raise ValueError(f"expected [B, T, d], got {tuple(x.shape)}")
         self._check(i, x.shape[-1])
@@ -143,6 +145,10 @@ class Encoder(_Walker):
         for j, s in enumerate(S):
             streams[f"scale{j}"] = s
         streams["codes"] = Q.quantize(v, S, q)
+        needed = reconstruct or (spec.K > 1 and not spec.is_key(i + 1) and i + 1 < self.n_layers)
+        if not needed:
+            self.prev = None
+            return streams, None
         vhat = _reconstruct(streams, q, spec, O)
         xhat = vhat if key else self.prev.to(x.device) + vhat
         self.prev = xhat

@@ -15,6 +15,7 @@ from .container import Writer, Reader, transcode, FORMAT, VERSION
 from .model import ModelAdapter, FunctionAdapter, TLAdapter
 from .store import Store, Reader2, is_v2
 from .sink import Sink, Layers
+from .regimes import REGIMES, resolve as resolve_spec
 from .model import tl_layers
 
 
@@ -37,4 +38,4 @@ def open(path, verify=True):
 __all__ = ["Spec", "Calib", "calibrate", "Encoder", "Decoder", "encode", "decode",
            "Writer", "Reader", "transcode", "FORMAT", "VERSION", "__version__",
            "ModelAdapter", "FunctionAdapter", "TLAdapter", "Store", "Reader2", "is_v2", "open",
-           "Sink", "Layers", "hf_layers", "tl_layers"]
+           "Sink", "Layers", "hf_layers", "tl_layers", "REGIMES", "resolve_spec"]
