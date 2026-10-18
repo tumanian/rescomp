@@ -28,7 +28,7 @@ model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-8B", dtype=torch.bfloat
 batch = tok(["The history of the Roman Empire", "To make a tomato sauce, first"], return_tensors="pt", padding=True).to("cuda")
 
 sink = rc.Sink("runs/demo", layers=rc.hf_layers(model, [24, 28, 32, 35]),
-               spec="int4_g512+layerK4+out32+key=bf16")                   # tokens come from a pre-hook
+               spec="balanced")                                           # a regime, or any spec string
 with sink, torch.no_grad():
     logits = model(**batch).logits                 # one forward call = one chunk
     out = model.generate(**batch, max_new_tokens=80)   # prompt + steps = one sequence per prompt
@@ -66,9 +66,37 @@ annotations). `rc.open()` also still reads the single-file RSC1 format from the 
 .encode_layer(i, x)` one layer at a time (closed-loop deltas); `rc.Store` to write encoded chunks yourself;
 `rc.transcode(src, dst, spec)` to re-encode an RSC1 file.
 
+## Regimes
+
+Four named settings cover the useful range; pass one as `spec=`. Each is a spec template whose group and
+outlier counts scale with the model width `d` (resolved when the sink sees its first batch).
+
+| Regime | Spec | Keep in mind |
+|---|---|---|
+| `exact` | `fp16` | bit-exact for bf16 models |
+| `faithful` | `int8_tok+out8` | every layer at single-layer KL ≈ 0.001 |
+| `balanced` | `int4_g(d/8)+layerK4+out(d/128)+key=bf16` | every 4th layer stored exactly; the rest at KL ≤ 0.005 |
+| `compact` | `int4_g(d/8)+layerK4+out(d/128)` | the 5× point; small models pay more |
+
+Measured on eight models (compression ratio vs bf16 / perplexity change with the codec live in the forward pass,
+late third of layers, wikitext; details and per-layer numbers in `RESULTS.md`):
+
+| Model | `exact` | `faithful` | `balanced` | `compact` |
+|---|---|---|---|---|
+| GPT-2 | 1.5× / +0.0% | 2.4× / +0.1% | 3.0× / +1.9% | 4.7× / +2.9% |
+| Qwen3-1.7B | 1.5× / +0.0% | 2.5× / -0.3% | 2.6× / +1.1% | 5.0× / +6.8% |
+| Gemma-2-2B | 1.5× / +0.0% | 2.6× / +0.2% | 2.7× / +1.2% | 5.0× / +7.0% |
+| Qwen3-8B | 1.5× / +0.0% | 2.6× / +0.1% | 3.0× / +1.8% | 5.2× / +6.8% |
+| Qwen3-14B | 1.5× / +0.0% | 2.6× / +0.1% | 3.0× / +1.2% | 5.2× / +4.3% |
+| Gemma-2-9B | 1.5× / +0.0% | 2.6× / +0.5% | 3.0× / +1.2% | 5.1× / +3.9% |
+| OLMoE-1B-7B (MoE) | 1.5× / +0.0% | 2.5× / +0.7% | 2.4× / +0.6% | 5.0× / +4.1% |
+| Qwen3-30B-A3B (MoE) | 1.5× / +0.0% | 2.7× / +0.2% | 3.0× / +1.8% | 5.1× / +5.7% |
+
+![Four regimes on eight models](docs/regimes.png)
+
 ## Specs
 
-`<quant>[+layerK<K>][+out<n>][+sink<s>][+key=<quant>]`
+Anything beyond the four regimes is a spec string: `<quant>[+layerK<K>][+out<n>][+sink<s>][+key=<quant>]`
 
 | Part | Meaning |
 |---|---|
@@ -82,9 +110,8 @@ annotations). `rc.open()` also still reads the single-file RSC1 format from the 
 | `+sink<s>` | keep the first s tokens of every sequence in bf16 |
 | `+key=<quant>` | hybrid: keyframe layers use this quantizer (`key=bf16` keeps every K-th layer exact) |
 
-Measured on eight models (see `RESULTS.md`): `fp16` 1.5× lossless; `int8_tok+out8` 2.5× at ≤ 0.7% perplexity;
-`uabs(0.1·rms)+out8` 3.0× at ≤ 0.6%; `int4_g(d/8)+layerK4+out(d/128)+key=bf16` 2.4–3.0× with a third of the
-layers exact; `int4_g(d/8)+layerK4+out(d/128)` 5.0–5.2× at +4–7% (more on small models); never int2.
+Beyond the regimes, `uabs(0.1·rms)+out8` is worth knowing: 3.0× at ≤ 0.6% perplexity with no exact layers
+(the step must be set from the activations' rms). `nvfp4+layerK4+out8` gives 3.7× at +0.5–2%.
 
 ## Instrumentation (separate from the sink)
 
