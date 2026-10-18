@@ -13,7 +13,19 @@ from .spec import Spec
 from .codec import Calib, calibrate, Encoder, Decoder, encode, decode
 from .container import Writer, Reader, transcode, FORMAT, VERSION
 from .model import ModelAdapter, FunctionAdapter, TLAdapter
+from .store import Store, Reader2, is_v2
+
+
+def open(path, verify=True):
+    """Open a stored capture: a format-2 stem (<stem>.meta.parquet + blob files) or a single RSC1 file."""
+    import os
+    path = str(path)
+    if is_v2(path):
+        return Reader2(path, verify=verify)
+    if os.path.isfile(path):
+        return Reader(path, verify=verify)
+    raise ValueError(f"{path}: neither a format-2 stem nor an RSC1 file")
 
 __all__ = ["Spec", "Calib", "calibrate", "Encoder", "Decoder", "encode", "decode",
            "Writer", "Reader", "transcode", "FORMAT", "VERSION", "__version__",
-           "ModelAdapter", "FunctionAdapter", "TLAdapter"]
+           "ModelAdapter", "FunctionAdapter", "TLAdapter", "Store", "Reader2", "is_v2", "open"]
