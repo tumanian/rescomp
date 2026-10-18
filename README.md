@@ -1,7 +1,9 @@
 # rescomp
 
 Compress residual-stream activations from a transformer and store them in one self-describing file, with the
-model, layer, token and label metadata that interpretability work needs later. Pure PyTorch + zstd, CPU or GPU.
+model, layer, token and label metadata that interpretability work needs later. Pure PyTorch + zstd, CPU or GPU,
+and framework-agnostic: the codec and file format never see a model, and capture and evaluation talk to a small
+`ModelAdapter` interface (Hugging Face, TransformerLens and plain-function adapters are included).
 
 - `PLAN.md`: the one-page design.
 - `RESULTS.md`: measurements on real models (ratio, KL, perplexity, coherence).
@@ -11,7 +13,7 @@ model, layer, token and label metadata that interpretability work needs later. P
 ```bash
 pip install -e .            # torch, numpy, zstandard
 pip install -e '.[hf]'      # + transformers, datasets (capture from Hugging Face models)
-pytest                      # ~190 tests, CPU only, ~1 min (tests/test_golden.py pins every codec's bytes)
+pytest                      # ~185 tests, CPU only, ~1 min (tests/test_golden.py pins every codec's bytes)
 ```
 
 ## Use
@@ -19,10 +21,11 @@ pytest                      # ~190 tests, CPU only, ~1 min (tests/test_golden.py
 ```python
 import rescomp as rc
 from rescomp import capture as C, evaluate as E
+from rescomp.hf import load_model
 
-model, tok = C.load_model("gpt2")                                   # any HF causal LM
+model, tok = load_model("gpt2")                                      # HFAdapter over any HF causal LM
 tokens = C.wikitext_sequences(tok, n_seq=128, seq_len=256)           # or C.pack_sequences(tok, texts, ...)
-C.capture(model, tok, tokens, layers=[8, 9, 10, 11], spec="int4_g384+layerK4+out12", out="gpt2.rsc",
+C.capture(model, tokens, layers=[8, 9, 10, 11], spec="int4_g384+layerK4+out12", out="gpt2.rsc",
           annotations={"doc_id": doc_ids})                           # any per-sequence arrays ride along
 
 r = rc.Reader("gpt2.rsc")
@@ -40,6 +43,21 @@ rc.transcode("gpt2_bf16.rsc", "gpt2_int4.rsc", "int4_g384+layerK4+out12")   # re
 
 Lower level: `rc.encode(X, spec, calib)` / `rc.decode(streams, spec, calib)` on an `[L, B, T, d]` stack, or
 `rc.Encoder(...).encode_layer(i, x)` one layer at a time (closed-loop deltas).
+
+### Other models and frameworks
+
+Capture and evaluation only need a `ModelAdapter` (`rescomp/model.py`): `n_layers`, `d_model`, `device`, `info()`
+for the header, `hook_names(layer)`, `moe_layers()`, and `forward(tokens, capture=(), patch=None, routers=())`
+returning `(logits, {layer: activation}, routing)`. Three are included:
+
+- `rescomp.hf.HFAdapter` for Hugging Face causal LMs (the only module that imports `transformers`), with
+  multi-GPU `device_map` and MoE router capture.
+- `rescomp.model.TLAdapter` for a TransformerLens `HookedTransformer` (site `blocks.<l>.hook_resid_post`).
+- `rescomp.model.FunctionAdapter` for anything else: hand it one function that runs tokens to logits, collects the
+  requested layers and applies `rescomp.model.apply_patch(layer, x, patch)` after each layer.
+
+`tests/test_generic.py` runs the full pipeline on a hand-written torch model with `transformers` blocked from
+importing.
 
 Command line: `rescomp info FILE`, `rescomp capture --model gpt2 --layers 8 9 10 11 --spec ... --out FILE`,
 `rescomp eval FILE [--live] [--coherence]`.
