@@ -54,7 +54,7 @@ with rc.Writer("gpt2_l8-11.rsc", model=info, layers=[8,9,10,11], spec=spec, cali
     w.write(acts, tokens, annotations={"doc_id": ids})          # acts [L, B, T, d]; call per batch
 r = rc.Reader("gpt2_l8-11.rsc")
 r.header["model"]; r.tokens(); r.read(layer=9, seqs=slice(0, 16))  # -> [16, T, d] fp32
-rc.capture(model_name, layers, n_seq, seq_len, spec, out)      # HF model -> file, in one call
+C.capture(adapter, tokens, layers, spec, out)                   # any ModelAdapter -> file, in one call
 ```
 
 CLI: `rescomp info FILE`, `rescomp capture`, `rescomp eval`.
