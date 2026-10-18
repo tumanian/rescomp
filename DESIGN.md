@@ -1,6 +1,6 @@
-# Design: the sink (next step, not built yet)
+# Design: the sink
 
-Decisions taken 2026-10-18. This replaces the "capture wraps the model" API: the production flow is
+Decisions taken 2026-10-18, built the same day (`rescomp/sink.py`, `rescomp/store.py`, `rescomp/instrument.py`). This replaces the "capture wraps the model" API: the production flow is
 *initialize once (hooks), run the model untouched, look at what is stored*. Instrumentation (patching
 reconstructions back into a model, KL, coherence) is a separate regime and must not leak into it.
 
@@ -59,9 +59,8 @@ Dependency: `pyarrow`.
 perplexity ratio, generation coherence). Uses the same module-object convention as the sink; the
 `ModelAdapter` protocol goes away once this exists.
 
-## Open points
+## Status
 
-- Default rotation size (4 GB proposed) and staging-buffer limit (2 GB proposed).
-- Whether a background encoder thread is worth having for the offline mode, or encode-on-flush only (proposed:
-  flush only, as decided).
-- Keep RSC1 readable (one-file format) or migrate: proposed to keep `Reader` able to open both.
+Built as designed: defaults are 4 GB rotation and 2 GB staging buffer; the offline mode encodes on flush only;
+`rc.open()` reads both the format-2 stem and the single-file RSC1 format. Not done: a background encoder thread;
+retiring `rescomp.evaluate` and the `ModelAdapter` protocol (still used by `scripts/run_models.py`).

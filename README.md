@@ -1,66 +1,69 @@
 # rescomp
 
-Compress residual-stream activations from a transformer and store them in one self-describing file, with the
-model, layer, token and label metadata that interpretability work needs later. Pure PyTorch + zstd, CPU or GPU,
-and framework-agnostic: the codec and file format never see a model, and capture and evaluation talk to a small
-`ModelAdapter` interface (Hugging Face, TransformerLens and plain-function adapters are included).
+Compress the residual-stream activations of a running transformer and keep them, with the tokens, labels and
+model metadata that interpretability work needs later. Pure PyTorch + zstd + Parquet, CPU or GPU, any framework
+whose layers are `nn.Module`s. The model is not wrapped: you add a sink, run the model as you always do, and read
+the files afterwards.
 
-- `PLAN.md`: the one-page design.
-- `RESULTS.md`: measurements on real models (ratio, KL, perplexity, coherence).
+- `DESIGN.md`: the design decisions behind the sink and the storage layout.
+- `RESULTS.md`: what each codec costs, measured on eight models (GPT-2 to Qwen3-30B-A3B, dense and MoE).
+- `PLAN.md`: the original one-page plan.
 
 ## Install
 
 ```bash
-pip install -e .            # torch, numpy, zstandard
-pip install -e '.[hf]'      # + transformers, datasets (capture from Hugging Face models)
-pytest                      # ~185 tests, CPU only, ~1 min (tests/test_golden.py pins every codec's bytes)
+pip install -e .            # torch, numpy, zstandard, pyarrow
+pip install -e '.[hf]'      # + transformers, datasets
+pytest                      # ~210 tests, CPU only, under a minute
 ```
 
 ## Use
 
 ```python
-import rescomp as rc
-from rescomp import capture as C, evaluate as E
-from rescomp.hf import load_model
+import torch, rescomp as rc
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-model, tok = load_model("gpt2")                                      # HFAdapter over any HF causal LM
-tokens = C.wikitext_sequences(tok, n_seq=128, seq_len=256)           # or C.pack_sequences(tok, texts, ...)
-C.capture(model, tokens, layers=[8, 9, 10, 11], spec="int4_g384+layerK4+out12", out="gpt2.rsc",
-          annotations={"doc_id": doc_ids})                           # any per-sequence arrays ride along
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-8B", dtype=torch.bfloat16).cuda().eval()
+batch = tok(["The history of the Roman Empire", "To make a tomato sauce, first"], return_tensors="pt", padding=True).to("cuda")
 
-r = rc.Reader("gpt2.rsc")
-print(r.summary())
-r.header["model"], r.header["layers"][1]                             # model id/revision/config, per-layer quant + fidelity
-x = r.read(layer=9, seqs=slice(0, 16))                               # [16, T, d] fp32: exactly the encoder's reconstruction
-r.tokens(), r.annotation("doc_id")
+sink = rc.Sink("runs/demo", layers=rc.hf_layers(model, [24, 28, 32, 35]),
+               spec="int4_g512+layerK4+out32+key=bf16", encode="cpu")     # tokens come from a pre-hook
+with sink, torch.no_grad():
+    logits = model(**batch).logits                 # one forward call = one chunk
+    out = model.generate(**batch, max_new_tokens=80)   # prompt + steps = one sequence per prompt
+print(sink.stats())                                # chunks, sequences, bytes, ratio, per-layer rel L2
 
-E.evaluate_file("gpt2.rsc", model)                                   # KL / perplexity with the last stored layer patched in
-E.evaluate_file_per_layer("gpt2.rsc", model)                         # ... one layer at a time
-E.evaluate_live(model, tokens, layers, spec, calib)                  # codec inside the forward pass (errors compound)
-E.coherence(model, prompts, layers, spec, calib, tokenizer=tok)      # generation with the codec on, paired perplexity
-rc.transcode("gpt2_bf16.rsc", "gpt2_int4.rsc", "int4_g384+layerK4+out12")   # re-encode without the model
+r = rc.open("runs/demo")
+r.sequences()                                      # Parquet table: seq_id, n_tokens, tokens, mask, annotations
+x = r.read(32, seqs=[2, 3])                        # each sequence whole, [T_i, d] fp32 (the encoder's own reconstruction)
+r.tokens(2); r.header["model"]; r.header["layers"][1]["fidelity"]
 ```
 
-Lower level: `rc.encode(X, spec, calib)` / `rc.decode(streams, spec, calib)` on an `[L, B, T, d]` stack, or
-`rc.Encoder(...).encode_layer(i, x)` one layer at a time (closed-loop deltas).
+- `layers`: `rc.hf_layers(model, [...])` for Hugging Face, `rc.tl_layers(model, [...])` for TransformerLens, or
+  any `{layer: nn.Module}` whose outputs are the residual stream (then pass `rc.Layers(modules=..., root=model)`
+  if you want the token pre-hook).
+- `encode="cpu"` (default): hooks copy raw bf16 to a staging buffer and return; encoding runs at `sink.flush()`,
+  when the buffer passes its limit, and at close. `encode="inline"`: the codec runs in the hook on the model's device.
+- Tokens: taken from each call by a pre-hook on the root model (`input_ids`, `attention_mask`, and the KV-cache
+  signal that tells a generation step from a new prompt); `sink.tokens(ids)` overrides, `tokens="off"` disables.
+- `sink.annotate(doc_id=[...], split="train")` labels the sequences the next new-sequence call starts; labels become
+  Parquet columns.
+- Outlier channels (`+out`) are calibrated on the first chunk unless `calib=` is given.
 
-### Other models and frameworks
+### Storage (format 2)
 
-Capture and evaluation only need a `ModelAdapter` (`rescomp/model.py`): `n_layers`, `d_model`, `device`, `info()`
-for the header, `hook_names(layer)`, `moe_layers()`, and `forward(tokens, capture=(), patch=None, routers=())`
-returning `(logits, {layer: activation}, routing)`. Three are included:
+`<stem>.00000.rsc, ...` hold only the compressed tensor blobs (append-only, rotated at `rotate_bytes`, 4 GB by
+default). `<stem>.meta.parquet` has the model, spec, calibration, stored layers with hook names and measured
+fidelity, and byte counts; `<stem>.chunks.parquet` which sequences each chunk holds and where; `<stem>.blobs.parquet`
+one row per blob (byte range, crc, dtype, shape); `<stem>.tokens.parquet` one row per sequence (tokens, mask,
+annotations). `rc.open()` also still reads the single-file RSC1 format from the earlier study.
 
-- `rescomp.hf.HFAdapter` for Hugging Face causal LMs (the only module that imports `transformers`), with
-  multi-GPU `device_map` and MoE router capture.
-- `rescomp.model.TLAdapter` for a TransformerLens `HookedTransformer` (site `blocks.<l>.hook_resid_post`).
-- `rescomp.model.FunctionAdapter` for anything else: hand it one function that runs tokens to logits, collects the
-  requested layers and applies `rescomp.model.apply_patch(layer, x, patch)` after each layer.
+### Lower level
 
-`tests/test_generic.py` runs the full pipeline on a hand-written torch model with `transformers` blocked from
-importing.
-
-Command line: `rescomp info FILE`, `rescomp capture --model gpt2 --layers 8 9 10 11 --spec ... --out FILE`,
-`rescomp eval FILE [--live] [--coherence]`.
+`rc.encode(X, spec, calib)` / `rc.decode(streams, spec, calib)` on an `[L, B, T, d]` stack; `rc.Encoder(...)
+.encode_layer(i, x)` one layer at a time (closed-loop deltas); `rc.Store` to write encoded chunks yourself;
+`rc.transcode(src, dst, spec)` to re-encode an RSC1 file.
 
 ## Specs
 
@@ -68,30 +71,34 @@ Command line: `rescomp info FILE`, `rescomp capture --model gpt2 --layers 8 9 10
 
 | Part | Meaning |
 |---|---|
-| `fp32`, `bf16`, `fp16` | plain casts (bf16 is lossless for a bf16 model), then byte-shuffle + zstd |
+| `fp32`, `bf16`, `fp16` | plain casts (bf16 is lossless for a bf16 model; fp16 too, at 1.5×), then byte-shuffle + zstd |
 | `fp8_e4m3`, `int8_tok` | 8-bit codes with one fp16 scale per token |
 | `int4_g<G>`, `int2_g<G>`, `int8_g<G>` | integer codes with one fp16 scale per group of G channels (G must divide d) |
 | `uabs<step>` | fixed step in activation units; zigzag integer codes in byte planes, so zstd does the entropy coding |
 | `mxfp4`, `nvfp4` | 4-bit floats with a shared block scale (32 or 16 channels) |
 | `+layerK<K>` | code stored layer i as `x_i - xhat_{i-1}` except every K-th layer (closed loop, so errors do not accumulate) |
-| `+out<n>` | keep the n highest-energy channels of each layer in bf16 (chosen on a calibration sample; stored in the header) |
+| `+out<n>` | keep the n highest-energy channels of each layer in bf16 (calibrated; stored in the header) |
 | `+sink<s>` | keep the first s tokens of every sequence in bf16 |
-| `+key=<quant>` | hybrid: keyframe layers use this quantizer (e.g. `key=bf16` keeps every K-th layer exact) |
+| `+key=<quant>` | hybrid: keyframe layers use this quantizer (`key=bf16` keeps every K-th layer exact) |
 
-Starting points from the earlier study: `int4_g384+layerK4+out12` for GPT-2 small, `int4_g512+layerK4+out32`
-for Qwen3-8B (about 5x at +2-6% perplexity), `uabs<0.1 x rms>+out8` for high fidelity. Compare specs at matched
-KL or perplexity: without `+out`, the massive channels make 8-bit codes collapse and look better than they are.
+Measured on eight models (see `RESULTS.md`): `fp16` 1.5× lossless; `int8_tok+out8` 2.5× at ≤ 0.7% perplexity;
+`uabs(0.1·rms)+out8` 3.0× at ≤ 0.6%; `int4_g(d/8)+layerK4+out(d/128)+key=bf16` 2.4–3.0× with a third of the
+layers exact; `int4_g(d/8)+layerK4+out(d/128)` 5.0–5.2× at +4–7% (more on small models); never int2.
 
-## File format (RSC1)
+## Instrumentation (separate from the sink)
 
-`"RSC1" | u64 header offset | u64 header length | blobs | JSON header`. One `write` call = one chunk of sequences;
-every (chunk, layer, stream) is its own zstd blob with a CRC, so one layer of one chunk can be read alone (a delta
-layer also decodes the earlier layers of its keyframe group). The header records the model (id, revision,
-architecture, config summary, dtype, tokenizer), the capture (site, hook names in HF and TransformerLens naming,
-seq_len, hardware, library version), the spec and calibration, per-layer measured fidelity (rel L2, max abs error),
-byte counts, tokens and attention masks per chunk, and named per-sequence annotations. `rescomp info FILE` prints it.
+`rescomp.instrument` feeds reconstructions back into a running model and measures the change, with the same
+module-object convention and any `run(tokens) -> logits` callable:
 
-## Evaluate on real models
+```python
+from rescomp import instrument as I
+L = rc.hf_layers(model, [24, 28, 32, 35])
+run = lambda t: model(t, use_cache=False).logits
+I.kl_ppl(run, tokens, I.Patcher(L, I.LiveCodec("int4_g512+layerK4+out32")))   # codec inside the forward pass
+I.kl_ppl(run, tokens, I.Patcher(L, rc.open("runs/demo")), seq_ids=range(64))  # stored reconstructions
+I.per_layer(run, tokens, L, I.LiveCodec("int8_tok+out8"))                       # one layer at a time
+I.coherence(run, prompts, I.Patcher(L, I.LiveCodec(spec)), tokenizer=tok)       # generation, paired perplexity
+```
 
-`scripts/run_models.py` captures a model once (bf16), transcodes to a ladder of specs and measures each
-(`scripts/report.py` renders the tables); `scripts/aws.sh` drives the GPU box. See `RESULTS.md`.
+`rescomp.evaluate` and the `ModelAdapter` protocol (`rescomp.model`, `rescomp.hf.HFAdapter`) are the earlier,
+adapter-based versions of the same measurements; `scripts/run_models.py` still uses them for the study in RESULTS.md.
