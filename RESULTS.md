@@ -2,7 +2,7 @@
 
 *2026-10-17. Eight models on three AWS boxes (one A10G for most, one L40S for Qwen3-14B, four A10Gs for the 30B
 mixture of experts). Numbers regenerate with `scripts/run_all.sh`, `scripts/run_extras.sh`, `scripts/run_larger.sh`
-and `scripts/report.py`; raw records in `results/<model>/results.jsonl`, generations in `results/<model>/generations_*.jsonl`.*
+and `scripts/report.py`; the raw records (`results/<model>/results.jsonl`, generations) are kept out of the repo.*
 
 ## Setup
 

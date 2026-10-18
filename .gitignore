@@ -6,6 +6,6 @@ __pycache__/
 .coverage
 *.rsc
 !tests/data/*.rsc
-results/logs/
+results/
 dumps/
 scripts/.box*
