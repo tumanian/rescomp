@@ -30,8 +30,11 @@ rec.stats()                                 # chunks, sequences, bytes, ratio, p
     calibration uses the first `calib_seqs` buffered sequences. A byte limit on the buffer forces a flush.
 - **File rotation at a size limit**, large (default 4 GB per tensor file): `run1.00000.rsc`, `run1.00001.rsc`, ...
   The index records which file each blob lives in.
-- **Generation**: with the KV cache each step yields `[B, 1, d]`; the recorder stitches steps along the sequence
-  axis until the generate call returns, and stitches tokens the same way. Sequence length is per chunk.
+- **Generation is handled on read, not on write.** With the KV cache each step yields `[B, 1, d]`. Every chunk
+  carries a sequence id and a start position; the reader concatenates the chunks of a sequence. A call with more
+  than one token and no cache starts a new sequence, a one-token call with a cache continues it (read off the call's
+  arguments by the pre-hook). Inline mode encodes per call (small blobs compress ~10-20% worse); CPU mode groups
+  slices by sequence at flush and gets the compact layout for free. Sequence length is per chunk.
 
 ## Storage layout (format version 2)
 
@@ -41,8 +44,8 @@ Tensors and metadata are separated:
 |---|---|
 | `run1.<n>.rsc` | only the compressed tensor blobs (codes, scales, outliers, sink rows), one blob per (chunk, layer, stream), concatenated; a magic and a format version at the front |
 | `run1.meta.parquet` | one row: format version, library version, created, model info (JSON), spec, calibration (JSON), lossless settings, site, stored layers with hook names and measured fidelity (JSON) |
-| `run1.blobs.parquet` | one row per blob: chunk, layer, stream, file number, offset, nbytes, raw_nbytes, crc32, dtype, shape |
-| `run1.tokens.parquet` | one row per sequence: seq id, chunk, position in chunk, seq_len, token ids (list<int32>), attention mask (list<uint8>, optional), and every annotation as its own column (scalars as plain columns, per-token arrays as list columns, per-layer routing as list columns) |
+| `run1.blobs.parquet` | one row per blob: chunk, sequence id, start position, n_tokens, layer, stream, file number, offset, nbytes, raw_nbytes, crc32, dtype, shape |
+| `run1.tokens.parquet` | one row per sequence: seq id, n_tokens, token ids (list<int32>), attention mask (list<uint8>, optional), and every annotation as its own column (scalars as plain columns, per-token arrays as list columns, per-layer routing as list columns) |
 
 Why: the per-sequence table is directly queryable (pandas, DuckDB, Polars) without touching the tensors, tokens
 and labels live next to each other, and the tensor file stays a dumb append-only stream that rotation can cut.
@@ -58,7 +61,6 @@ perplexity ratio, generation coherence). Uses the same module-object convention 
 
 ## Open points
 
-- Generation stitching in the first version, or forward-only first.
 - Default rotation size (4 GB proposed) and staging-buffer limit (2 GB proposed).
 - Whether a background encoder thread is worth having for the offline mode, or encode-on-flush only (proposed:
   flush only, as decided).
