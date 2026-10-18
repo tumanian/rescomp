@@ -11,6 +11,7 @@ from contextlib import contextmanager
 import torch
 
 from .model import apply_patch
+from .sink import Layers, extract_tokens_generic
 
 BLOCK_ATTRS = ["model.layers", "transformer.h", "model.decoder.layers", "gpt_neox.layers", "layers"]
 CONFIG_KEYS = ["hidden_size", "n_embd", "num_hidden_layers", "n_layer", "num_attention_heads", "n_head",
@@ -120,3 +121,13 @@ def load_model(model_id, dtype="bfloat16", device=None, revision=None, attn_impl
     if not device_map:
         model.to(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     return HFAdapter(model, tok, model_id=model_id, revision=revision), tok
+
+
+def hf_layers(model, layers, tokenizer=None, model_id=None, revision=None):
+    """Modules to hook for a Sink: the decoder blocks of `layers`, with the header info of an HFAdapter."""
+    a = HFAdapter(model, tokenizer, model_id=model_id, revision=revision)
+    layers = sorted(int(l) for l in layers)
+    if any(not 0 <= l < a.n_layers for l in layers):
+        raise ValueError(f"layers {layers} outside [0, {a.n_layers})")
+    return Layers(modules={l: a.blocks[l] for l in layers}, root=model, hook_names={l: a.hook_names(l) for l in layers},
+                  model_info=a.info(), extract=extract_tokens_generic, n_layers=a.n_layers)

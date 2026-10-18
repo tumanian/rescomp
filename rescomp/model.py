@@ -126,3 +126,16 @@ class TLAdapter:
 
     def moe_layers(self):
         return []
+
+
+def tl_layers(model, layers, model_id=None):
+    """Modules to hook for a Sink on a TransformerLens HookedTransformer: blocks.<l>.hook_resid_post (HookPoints
+    are modules). TransformerLens passes tokens positionally, so the generic extractor works."""
+    from .sink import Layers, extract_tokens_generic
+    a = TLAdapter(model, model_id=model_id)
+    layers = sorted(int(l) for l in layers)
+    if any(not 0 <= l < a.n_layers for l in layers):
+        raise ValueError(f"layers {layers} outside [0, {a.n_layers})")
+    return Layers(modules={l: model.blocks[l].hook_resid_post for l in layers}, root=model,
+                  hook_names={l: a.hook_names(l) for l in layers}, model_info=a.info(),
+                  extract=extract_tokens_generic, n_layers=a.n_layers)

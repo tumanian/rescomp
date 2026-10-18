@@ -14,6 +14,14 @@ from .codec import Calib, calibrate, Encoder, Decoder, encode, decode
 from .container import Writer, Reader, transcode, FORMAT, VERSION
 from .model import ModelAdapter, FunctionAdapter, TLAdapter
 from .store import Store, Reader2, is_v2
+from .sink import Sink, Layers
+from .model import tl_layers
+
+
+def hf_layers(model, layers, tokenizer=None, model_id=None, revision=None):
+    """Modules to hook for a Sink on a Hugging Face causal LM (imports transformers lazily)."""
+    from .hf import hf_layers as _hf
+    return _hf(model, layers, tokenizer, model_id, revision)
 
 
 def open(path, verify=True):
@@ -28,4 +36,5 @@ def open(path, verify=True):
 
 __all__ = ["Spec", "Calib", "calibrate", "Encoder", "Decoder", "encode", "decode",
            "Writer", "Reader", "transcode", "FORMAT", "VERSION", "__version__",
-           "ModelAdapter", "FunctionAdapter", "TLAdapter", "Store", "Reader2", "is_v2", "open"]
+           "ModelAdapter", "FunctionAdapter", "TLAdapter", "Store", "Reader2", "is_v2", "open",
+           "Sink", "Layers", "hf_layers", "tl_layers"]
