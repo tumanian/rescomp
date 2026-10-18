@@ -22,16 +22,16 @@ def cmd_info(a):
 
 
 def cmd_capture(a):
-    from .capture import capture, load_model, wikitext_sequences
+    from .capture import capture, wikitext_sequences
+    from .hf import load_model
     model, tok = load_model(a.model, dtype=a.dtype, revision=a.revision, attn_implementation=a.attn)
     tokens = wikitext_sequences(tok, a.n_seq, a.seq_len, seed=a.seed, bos=a.bos)
-    capture(model, tok, tokens, a.layers, a.spec, a.out, batch=a.batch, calib_seqs=a.calib_seqs,
-            model_id=a.model, revision=a.revision, level=a.level)
+    capture(model, tokens, a.layers, a.spec, a.out, batch=a.batch, calib_seqs=a.calib_seqs, level=a.level)
 
 
 def cmd_eval(a):
-    from .capture import load_model
     from .container import Reader
+    from .hf import load_model
     from .evaluate import PROMPTS, coherence, evaluate_file, evaluate_live
     with Reader(a.file) as r:
         header, layers, spec, calib = r.header, r.layers, r.spec, r.calib

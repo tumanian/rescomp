@@ -12,6 +12,8 @@ from ._version import __version__
 from .spec import Spec
 from .codec import Calib, calibrate, Encoder, Decoder, encode, decode
 from .container import Writer, Reader, transcode, FORMAT, VERSION
+from .model import ModelAdapter, FunctionAdapter, TLAdapter
 
 __all__ = ["Spec", "Calib", "calibrate", "Encoder", "Decoder", "encode", "decode",
-           "Writer", "Reader", "transcode", "FORMAT", "VERSION", "__version__"]
+           "Writer", "Reader", "transcode", "FORMAT", "VERSION", "__version__",
+           "ModelAdapter", "FunctionAdapter", "TLAdapter"]

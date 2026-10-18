@@ -21,6 +21,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import rescomp as rc                                   # noqa: E402
 from rescomp import capture as C, evaluate as E       # noqa: E402
+from rescomp.hf import load_model                      # noqa: E402
 from rescomp.evaluate import PROMPTS                   # noqa: E402
 
 DEFAULT_SPECS = ["bf16", "fp16", "fp8_e4m3+out8", "int8_tok+out8", "uabs@0.1+out8",
@@ -81,13 +82,13 @@ def main():
             done[rec["spec"]] = rec
     torch.manual_seed(0)
     t0 = time.time()
-    model, tok = C.load_model(a.model, dtype=a.dtype, revision=a.revision, attn_implementation=a.attn, device_map=a.device_map)
-    print(f"loaded {a.model} in {time.time() - t0:.0f}s on {set(str(p.device) for p in model.parameters())}", flush=True)
+    model, tok = load_model(a.model, dtype=a.dtype, revision=a.revision, attn_implementation=a.attn, device_map=a.device_map)
+    print(f"loaded {a.model} in {time.time() - t0:.0f}s on {set(str(p.device) for p in model.model.parameters())}", flush=True)
     tokens = C.wikitext_sequences(tok, a.n_seq, a.seq_len, seed=0, bos=a.bos, split=a.dataset_split)
     base = out / "base_bf16.rsc"
     if not base.exists():
-        C.capture(model, tok, tokens, a.layers, "bf16", base, batch=a.batch, model_id=a.model, revision=a.revision,
-                  level=a.level, extra={"corpus": f"wikitext-103-raw-v1 {a.dataset_split}", "seed": 0}, routers=a.routers)
+        C.capture(model, tokens, a.layers, "bf16", base, batch=a.batch, level=a.level,
+                  extra={"corpus": f"wikitext-103-raw-v1 {a.dataset_split}", "seed": 0}, routers=a.routers)
     with rc.Reader(base) as r:
         d = r.d
         ident = E.identity_check(model, r.tokens(slice(0, min(8, r.n_seq))), r.layers, batch=a.batch)

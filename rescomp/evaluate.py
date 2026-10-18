@@ -1,4 +1,4 @@
-"""How much does the compression change the model?
+"""How much does the compression change the model? `model` is any rescomp.model.ModelAdapter.
 
 Three measurements, all against the uncompressed model on the same tokens:
 
@@ -21,7 +21,6 @@ import math
 import torch
 import torch.nn.functional as F
 
-from .capture import forward
 from .codec import Encoder
 from .container import Reader
 from .spec import Spec
@@ -54,8 +53,8 @@ def kl_ppl(model, tokens, layers, patch_for_batch, batch=8):
     kls, agree, nll_c, nll_p = [], [], [], []
     for a in range(0, tokens.shape[0], batch):
         tb = tokens[a: a + batch]
-        clean, _ = forward(model, tb)
-        patched, _ = forward(model, tb, patch=patch_for_batch(a, tb))
+        clean, _, _ = model.forward(tb)
+        patched, _, _ = model.forward(tb, patch=patch_for_batch(a, tb))
         tgt = tb[:, 1:].to(clean.device)
         for j in range(len(tb)):
             lp = F.log_softmax(clean[j].float(), -1)
@@ -85,7 +84,7 @@ def evaluate_file(path, model, batch=8, n_seq=None, layers=None):
         n = min(n_seq or r.n_seq, r.n_seq)
         tokens = r.tokens(slice(0, n))
 
-        def patch(a, tb):                                   # the hook moves each tensor to its layer's device
+        def patch(a, tb):                                   # the adapter moves each tensor to its layer's device
             stack = r.read_stack(layers, slice(a, a + len(tb)))
             return {l: stack[j] for j, l in enumerate(layers)}
         out = kl_ppl(model, tokens, layers, patch, batch)
@@ -140,11 +139,11 @@ PROMPTS = [
 @torch.no_grad()
 def generate(model, ids, n_new, seed, patch=None, temperature=0.8, top_k=50):
     """Sampled continuation (no KV cache, so the hooks see the full prefix every step). ids [B, P] -> [B, P + n_new]."""
-    dev = model.get_input_embeddings().weight.device
+    dev = model.device
     ids = ids.to(dev)
     gen = torch.Generator(device=dev).manual_seed(seed)
     for _ in range(n_new):
-        logits, _ = forward(model, ids, patch=patch)
+        logits, _, _ = model.forward(ids, patch=patch)
         p = F.softmax(logits[:, -1].float() / temperature, -1)
         v, i = p.topk(top_k, -1)
         nxt = i.gather(-1, torch.multinomial(v / v.sum(-1, keepdim=True), 1, generator=gen))
@@ -165,7 +164,7 @@ def ngram_stats(toks):
 @torch.no_grad()
 def continuation_nll(model, ids, n_prompt):
     """Mean NLL of the continuation tokens under the clean model, given the prompt. ids [B, P + n]."""
-    logits, _ = forward(model, ids)
+    logits, _, _ = model.forward(ids)
     lp = F.log_softmax(logits[:, :-1].float(), -1)
     nll = -lp.gather(-1, ids[:, 1:, None].to(lp.device)).squeeze(-1)
     return nll[:, n_prompt - 1:].mean(-1).cpu()
