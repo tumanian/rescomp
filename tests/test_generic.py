@@ -15,6 +15,17 @@ from rescomp.model import FunctionAdapter, ModelAdapter, apply_patch
 D, L, V = 32, 3, 50
 
 
+class ResBlock(torch.nn.Module):
+    """x -> x + mlp(x): the block's output is the residual stream after it, like a decoder block."""
+
+    def __init__(self):
+        super().__init__()
+        self.mlp = torch.nn.Sequential(torch.nn.Linear(D, 2 * D), torch.nn.GELU(), torch.nn.Linear(2 * D, D))
+
+    def forward(self, x):
+        return x + self.mlp(x)
+
+
 class ToyLM(torch.nn.Module):
     """Embedding, L residual MLP blocks, unembedding. Not a Hugging Face model."""
 
@@ -22,15 +33,14 @@ class ToyLM(torch.nn.Module):
         super().__init__()
         torch.manual_seed(0)
         self.emb = torch.nn.Embedding(V, D)
-        self.blocks = torch.nn.ModuleList([torch.nn.Sequential(torch.nn.Linear(D, 2 * D), torch.nn.GELU(),
-                                                               torch.nn.Linear(2 * D, D)) for _ in range(L)])
+        self.blocks = torch.nn.ModuleList([ResBlock() for _ in range(L)])
         self.out = torch.nn.Linear(D, V)
 
     def run(self, tokens, capture, patch):
         x = self.emb(tokens)
         acts = {}
         for l, blk in enumerate(self.blocks):
-            x = x + blk(x)
+            x = blk(x)
             x = apply_patch(l, x, patch)
             if l in capture:
                 acts[l] = x
