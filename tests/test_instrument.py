@@ -45,7 +45,7 @@ def test_store_backed_patcher_matches_live(lm, toks, tmp_path):
     """Patching from the file gives the same logits as patching live with the same spec on the same data."""
     stem = str(tmp_path / "s")
     spec = "int4_g16+layerK2+out2"
-    with Sink(stem, layers_of(lm), spec, encode="inline") as sink:
+    with Sink(stem, layers_of(lm), spec) as sink:
         lm(toks[:4])
         lm(toks[4:])
     r = rc.open(stem)

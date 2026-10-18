@@ -14,13 +14,13 @@ def test_hf_layers_and_forward(tiny_model, fake_tok, tmp_path):
     toks = torch.randint(2, 256, (5, 10), generator=torch.Generator().manual_seed(0))
     mask = torch.ones(5, 10, dtype=torch.long)
     mask[4, 7:] = 0
-    with rc.Sink(str(tmp_path / "hf"), L, "int4_g16+layerK2+out2", encode="inline") as sink:
+    with rc.Sink(str(tmp_path / "hf"), L, "int4_g16+layerK2+out2") as sink:
         tiny_model(input_ids=toks[:3], attention_mask=mask[:3])
         tiny_model(toks[3:], attention_mask=mask[3:])
     with rc.open(str(tmp_path / "hf")) as r:
         assert r.n_seq == 5 and r.header["n_chunks"] == 2
         assert torch.equal(torch.stack(r.tokens()), toks) and r.attention_mask(4).tolist() == [1] * 7 + [0] * 3
-        _, acts, _ = HFAdapter(tiny_model).forward(toks[:3], capture=[1, 3])   # inline: encoder saw fp32 activations
+        _, acts, _ = HFAdapter(tiny_model).forward(toks[:3], capture=[1, 3])   # the encoder saw the fp32 activations
         exp = rc.encode(torch.stack([acts[1], acts[3]]), r.spec, r.calib)[1]
         assert torch.equal(torch.stack(r.read(3, [0, 1, 2])), exp[1])
     with pytest.raises(ValueError):
@@ -30,29 +30,26 @@ def test_hf_layers_and_forward(tiny_model, fake_tok, tmp_path):
 def test_generate_with_kv_cache(tiny_model, fake_tok, tmp_path):
     """Real HF generation: prefill + per-token steps with past_key_values; one sequence per prompt in the file."""
     prompt = torch.randint(2, 256, (2, 4), generator=torch.Generator().manual_seed(3))
-    with rc.Sink(str(tmp_path / "gen"), rc.hf_layers(tiny_model, [0, 2, 3], fake_tok), "int8_tok+layerK3", encode="cpu") as sink:
+    with rc.Sink(str(tmp_path / "gen"), rc.hf_layers(tiny_model, [0, 2, 3], fake_tok), "int8_tok+layerK3") as sink:
         out = tiny_model.generate(prompt, max_new_tokens=5, do_sample=False, pad_token_id=1, use_cache=True)
         stats = sink.stats()
     # 5 new tokens take 5 forward calls (prefill + 4 steps); the last sampled token is never run through the model
     assert out.shape == (2, 9) and stats["calls"] == 5 and stats["incomplete_calls"] == 0
     with rc.open(str(tmp_path / "gen")) as r:
-        assert r.n_seq == 2 and r.header["n_chunks"] == 1              # CPU mode merged the five calls
+        assert r.n_seq == 2 and r.header["n_chunks"] == 5              # one chunk per forward call
         assert r.sequences().column("n_tokens").to_pylist() == [8, 8]
         assert torch.equal(torch.stack(r.tokens()), out[:, :8])        # prompt + generated tokens, in order
         x = r.read(3, 0)
         assert x.shape == (8, 64)
-        # the stored prefill part equals a one-shot run of the prompt (same math; bf16 staging applied)
+        # the stored prefill part is exactly the encoding of a one-shot run of the prompt
         _, acts, _ = HFAdapter(tiny_model).forward(prompt, capture=[0, 2, 3])
-        staged = torch.stack([acts[l] for l in (0, 2, 3)]).to(torch.bfloat16).float()
-        with torch.no_grad():
-            exp_prompt = rc.encode(staged, r.spec)[1]
-        # layer 0 is a keyframe coded per token, so its prompt positions are identical in the stitched chunk
-        assert torch.allclose(r.read(0, 0)[:4], exp_prompt[0, 0], atol=1e-2)
+        exp_prompt = rc.encode(torch.stack([acts[l] for l in (0, 2, 3)]), r.spec)[1]
+        assert torch.equal(r.read(0, 0)[:4], exp_prompt[0, 0]) and torch.equal(r.read(3, 1)[:4], exp_prompt[2, 1])
 
 
-def test_generate_inline_mode_per_step_chunks(tiny_model, fake_tok, tmp_path):
+def test_generate_single_layer(tiny_model, fake_tok, tmp_path):
     prompt = torch.randint(2, 256, (1, 3))
-    with rc.Sink(str(tmp_path / "geni"), rc.hf_layers(tiny_model, [3], fake_tok), "bf16", encode="inline") as sink:
+    with rc.Sink(str(tmp_path / "geni"), rc.hf_layers(tiny_model, [3], fake_tok), "bf16") as sink:
         out = tiny_model.generate(prompt, max_new_tokens=4, do_sample=False, pad_token_id=1)
     with rc.open(str(tmp_path / "geni")) as r:
         assert r.header["n_chunks"] == 4 and r.n_seq == 1 and r.read(3, 0).shape == (6, 64)

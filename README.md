@@ -28,7 +28,7 @@ model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-8B", dtype=torch.bfloat
 batch = tok(["The history of the Roman Empire", "To make a tomato sauce, first"], return_tensors="pt", padding=True).to("cuda")
 
 sink = rc.Sink("runs/demo", layers=rc.hf_layers(model, [24, 28, 32, 35]),
-               spec="int4_g512+layerK4+out32+key=bf16", encode="cpu")     # tokens come from a pre-hook
+               spec="int4_g512+layerK4+out32+key=bf16")                   # tokens come from a pre-hook
 with sink, torch.no_grad():
     logits = model(**batch).logits                 # one forward call = one chunk
     out = model.generate(**batch, max_new_tokens=80)   # prompt + steps = one sequence per prompt
@@ -43,8 +43,9 @@ r.tokens(2); r.header["model"]; r.header["layers"][1]["fidelity"]
 - `layers`: `rc.hf_layers(model, [...])` for Hugging Face, `rc.tl_layers(model, [...])` for TransformerLens, or
   any `{layer: nn.Module}` whose outputs are the residual stream (then pass `rc.Layers(modules=..., root=model)`
   if you want the token pre-hook).
-- `encode="cpu"` (default): hooks copy raw bf16 to a staging buffer and return; encoding runs at `sink.flush()`,
-  when the buffer passes its limit, and at close. `encode="inline"`: the codec runs in the hook on the model's device.
+- The hook quantizes on the model's device (cheap kernels), starts asynchronous copies of the encoded streams to
+  pinned host memory and returns without synchronizing. zstd and the file writes run at `sink.flush()`, when the
+  host buffer passes `buffer_bytes`, and at close. `scripts/sink_overhead.py` measures the added forward time.
 - Tokens: taken from each call by a pre-hook on the root model (`input_ids`, `attention_mask`, and the KV-cache
   signal that tells a generation step from a new prompt); `sink.tokens(ids)` overrides, `tokens="off"` disables.
 - `sink.annotate(doc_id=[...], split="train")` labels the sequences the next new-sequence call starts; labels become

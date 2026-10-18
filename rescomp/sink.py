@@ -1,6 +1,6 @@
 """The Sink: hooks on a running model, activations flow into a format-2 store. The model is not wrapped.
 
-    sink = Sink("runs/run1", layers=hf_layers(model, [8, 9, 10, 11]), spec="int4_g384+layerK4+out12", encode="cpu")
+    sink = Sink("runs/run1", layers=hf_layers(model, [8, 9, 10, 11]), spec="int4_g384+layerK4+out12")
     with sink:
         model(**batch)              # one forward call = one chunk
         model.generate(**prompt)    # each step = one chunk; the reader returns the sequence whole
@@ -11,9 +11,10 @@ takes its output (the residual stream after that layer). Tokens: given with `sin
 forward, or taken by a forward pre-hook on the root model (`input_ids` keyword or first positional argument);
 `tokens="off"` records none.
 
-encode="cpu": hooks copy raw bf16 activations to a staging buffer and return; encoding runs at flush() (also
-forced when the buffer exceeds `buffer_bytes`, and at close). encode="inline": the closed-loop encoder runs in
-the hook on the model's device and the chunk is written at once.
+What happens where: the hook quantizes on the model's device (cheap map-and-reduce work, closed-loop deltas
+included), starts asynchronous copies of the encoded streams to pinned host memory and returns without
+synchronizing; the slow parts, zstd and the file writes, run at flush() (also forced when the host buffer
+exceeds `buffer_bytes`, and at close). The forward pass pays only for the quantizer kernels and the copies.
 
 Sequences: a call with T > 1 tokens starts B new sequences; a call with T == 1 continues the B open ones when
 the model says it is using a cache (HF: past_key_values / cache_position) or, lacking that signal, when the
@@ -65,10 +66,8 @@ def _first(o):
 
 
 class Sink:
-    def __init__(self, stem, layers, spec, *, encode="cpu", tokens=None, calib=None, calib_seqs=32,
-                 buffer_bytes=2 << 30, rotate_bytes=4 << 30, level=3, site="resid_post", extra=None, model_info=None):
-        if encode not in ("cpu", "inline"):
-            raise ValueError("encode must be 'cpu' or 'inline'")
+    def __init__(self, stem, layers, spec, *, tokens=None, calib=None, buffer_bytes=2 << 30, rotate_bytes=4 << 30,
+                 level=3, site="resid_post", extra=None, model_info=None):
         if tokens not in (None, "off"):
             raise ValueError("tokens must be None (pre-hook) or 'off'")
         self.spec = Spec.parse(spec)
@@ -77,21 +76,22 @@ class Sink:
         self.order = sorted(int(l) for l in L.modules)
         if not self.order:
             raise ValueError("no layers to hook")
-        self.encode_mode, self.record_tokens = encode, tokens is None
-        self.calib, self.calib_seqs = calib, calib_seqs
+        self.record_tokens = tokens is None
+        self.calib = calib
         self.buffer_bytes, self.site = buffer_bytes, site
         info = dict(L.model_info)
         info.update(model_info or {})
         info.setdefault("n_layers", L.n_layers)
         self.store = Store(stem, model=info, layers=self.order, spec=self.spec, calib=calib, site=site, level=level,
-                           hook_names=L.hook_names, extra={"encode": encode, **(extra or {})}, rotate_bytes=rotate_bytes)
+                           hook_names=L.hook_names, extra=dict(extra or {}), rotate_bytes=rotate_bytes)
         self.enc = None
         self._handles = []
         self._call = None                 # the forward call being observed: {"acts", "ids", "mask", "cont"}
         self._given = None                # tokens given explicitly for the next call
         self._pending_ann = {}
         self._open, self._len = [], {}    # open sequence ids and their current lengths
-        self._buffer, self._buffered = [], 0
+        self._buffer, self._buffered = [], 0     # encoded chunks waiting for zstd + write
+        self._events = []                         # CUDA events marking the end of each chunk's host copies
         self.n_calls = self.n_incomplete = 0
         self.t0 = time.time()
 
@@ -106,7 +106,8 @@ class Sink:
         self._pending_ann.update(cols)
 
     def flush(self):
-        self._encode_buffer()
+        """zstd + write everything encoded so far; the files are readable afterwards."""
+        self._write_buffer()
         self.store.flush()
 
     def stats(self):
@@ -117,7 +118,7 @@ class Sink:
 
     def close(self):
         self._remove_hooks()
-        self._encode_buffer()
+        self._write_buffer()
         self.store.close()
 
     def __enter__(self):
@@ -198,14 +199,9 @@ class Sink:
         for s in seq_ids:
             self._len[s] = self._len.get(s, 0) + T
         self.store.note_raw(B * T * d * 2 * len(acts), d)
-        if self.encode_mode == "inline":
-            self._write_chunk(seq_ids, starts, acts)
-        else:
-            staged = [a.to(torch.bfloat16).cpu() for a in acts]
-            self._buffer.append((tuple(seq_ids), starts, staged))
-            self._buffered += sum(a.numel() * 2 for a in staged)
-            if self._buffered >= self.buffer_bytes:
-                self.flush()
+        self._encode_call(seq_ids, starts, acts)
+        if self._buffered >= self.buffer_bytes:
+            self.flush()
 
     def _take_annotations(self, B):
         out = {}
@@ -219,11 +215,11 @@ class Sink:
         self._pending_ann = {}
         return out
 
-    # -- encoding
+    # -- encoding (in the hook, on the model's device)
     def _encoder(self, acts):
         if self.enc is None:
             if self.calib is None and self.spec.outliers:
-                self.calib = calibrate(torch.stack([a.float().cpu() for a in acts]), self.spec, source="first_chunk")
+                self.calib = calibrate(torch.stack([a.float() for a in acts]), self.spec, source="first_chunk")
             if self.spec.outliers:
                 self.calib.check(self.spec, len(self.order))
                 self.store.calib = self.calib
@@ -231,28 +227,37 @@ class Sink:
         self.enc.reset()
         return self.enc
 
-    def _write_chunk(self, seq_ids, starts, acts):
+    @staticmethod
+    def _to_host(t):
+        """Start a copy to pinned host memory and return the destination (synchronized later at flush)."""
+        if t.device.type == "cpu":
+            return t
+        dst = torch.empty(t.shape, dtype=t.dtype, device="cpu", pin_memory=True)
+        dst.copy_(t, non_blocking=True)
+        return dst
+
+    def _encode_call(self, seq_ids, starts, acts):
         enc = self._encoder(acts)
         streams, err = [], []
         for i, x in enumerate(acts):
             st, xhat = enc.encode_layer(i, x)
             xf = x.float()
-            e = (xf - xhat).double()
-            err.append((float(e.pow(2).sum()), float(xf.double().pow(2).sum()), float(e.abs().max())))
-            streams.append(st)
-        self.store.add_chunk(seq_ids, starts, streams, err)
+            e = xf - xhat
+            # error statistics stay on the device as 0-d tensors: reducing them here would synchronize
+            err.append(torch.stack([e.double().pow(2).sum(), xf.double().pow(2).sum(), e.abs().max().double()]))
+            streams.append({k: self._to_host(t) for k, t in st.items()})
+        dev = acts[0].device
+        event = None
+        if dev.type == "cuda":
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(dev))
+        self._buffer.append((list(seq_ids), list(starts), streams, torch.stack(err), event))
+        self._buffered += sum(t.numel() * t.element_size() for st in streams for t in st.values())
 
-    def _encode_buffer(self):
-        """CPU mode: merge consecutive calls that continue the same sequences, then encode each group."""
-        groups = []
-        for seq_ids, starts, acts in self._buffer:
-            if groups and groups[-1][0] == seq_ids and [s + groups[-1][3] for s in groups[-1][1]] == list(starts):
-                g = groups[-1]
-                g[2].append(acts)
-                g[3] += acts[0].shape[1]
-            else:
-                groups.append([seq_ids, list(starts), [acts], acts[0].shape[1]])
-        for seq_ids, starts, parts, _ in groups:
-            acts = [torch.cat([p[i] for p in parts], 1) for i in range(len(self.order))]
-            self._write_chunk(list(seq_ids), starts, acts)
+    def _write_buffer(self):
+        """The slow part, off the forward path: wait for the copies, then zstd + write each chunk."""
+        for seq_ids, starts, streams, err, event in self._buffer:
+            if event is not None:
+                event.synchronize()
+            self.store.add_chunk(seq_ids, starts, streams, err.cpu().tolist())
         self._buffer, self._buffered = [], 0

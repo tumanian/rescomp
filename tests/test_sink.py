@@ -25,30 +25,28 @@ def layers_of(lm, idx=(0, 1, 2)):
                   model_info={"id": "toy", "d_model": D}, n_layers=L)
 
 
-def reference(lm, toks, idx=(0, 1, 2), staged=True):
-    """What the sink's encoder sees: the model's activations, rounded to bf16 by the CPU staging buffer."""
+def reference(lm, toks, idx=(0, 1, 2)):
+    """What the sink's encoder sees: the model's activations as they are."""
     _, acts = lm.run(toks, list(idx), {})
-    x = torch.stack([acts[l] for l in idx]).detach()
-    return x.to(torch.bfloat16).float() if staged else x
+    return torch.stack([acts[l] for l in idx]).detach()
 
 
-@pytest.mark.parametrize("mode", ["cpu", "inline"])
-def test_forward_calls_become_chunks(lm, tmp_path, mode):
-    stem = str(tmp_path / mode)
+def test_forward_calls_become_chunks(lm, tmp_path):
+    stem = str(tmp_path / "fwd")
     toks = torch.randint(0, V, (7, 9), generator=torch.Generator().manual_seed(0))
     spec = rc.Spec.parse("int4_g16+layerK2+out2")
-    with Sink(stem, layers_of(lm), spec, encode=mode, calib_seqs=4) as sink:
+    with Sink(stem, layers_of(lm), spec) as sink:
         sink.annotate(doc=[10, 11, 12, 13], split="train")
         lm(toks[:4], attention_mask=torch.ones(4, 9))
         lm(input_ids=toks[4:])
         assert sink.stats()["calls"] == 2
     with rc.open(stem) as r:
-        assert r.n_seq == 7 and r.header["n_chunks"] == 2 and r.header["extra"]["encode"] == mode
+        assert r.n_seq == 7 and r.header["n_chunks"] == 2
         assert r.header["model"]["id"] == "toy" and r.header["layers"][0]["hook"] == {"toy": "blocks.0"}
         assert torch.equal(torch.stack(r.tokens()), toks)
         assert r.attention_mask(0).tolist() == [1] * 9 and r.attention_mask(5) is None
         assert r.annotation("doc") == [10, 11, 12, 13, None, None, None] and r.annotation("split", 2) == "train"
-        ref = reference(lm, toks, staged=(mode == "cpu"))
+        ref = reference(lm, toks)
         for i, l in enumerate((0, 1, 2)):
             got = torch.stack(r.read(l))
             # chunk-wise encoding of exactly these activations, calibrated on the first chunk
@@ -63,7 +61,7 @@ def test_generation_style_calls_are_one_sequence(lm, tmp_path):
     stem = str(tmp_path / "gen")
     toks = torch.randint(0, V, (2, 6), generator=torch.Generator().manual_seed(1))
     spec = rc.Spec.parse("int8_tok+layerK2")
-    with Sink(stem, layers_of(lm), spec, encode="cpu") as sink:
+    with Sink(stem, layers_of(lm), spec) as sink:
         lm(toks[:, :3])                               # prompt
         for t in range(3, 6):
             lm(toks[:, t: t + 1])                     # one new token per call, no cache signal: continuation by rule
@@ -71,22 +69,19 @@ def test_generation_style_calls_are_one_sequence(lm, tmp_path):
     with rc.open(stem) as r:
         assert r.n_seq == 4 and r.sequences().column("n_tokens").to_pylist() == [6, 6, 4, 4]
         assert torch.equal(r.tokens(0), toks[0]) and torch.equal(r.tokens(3), toks[1, :4])
-        # the CPU mode merged the four calls into one chunk per group before encoding
-        assert r.header["n_chunks"] == 2
+        assert r.header["n_chunks"] == 5                  # one chunk per forward call; stitched on read
         for l in (0, 1, 2):
-            got = r.read(l, 1)
-            assert got.shape == (6, D)
-        # per-step activations are what the model produced for that step (toy model: no cache, so identical)
-        ref_steps = [reference(lm, toks[:, :3])] + [reference(lm, toks[:, t: t + 1]) for t in range(3, 6)]
-        full = torch.cat(ref_steps, 2)
-        exp = rc.encode(full, spec)[1]
-        assert torch.equal(torch.stack(r.read(0, [0, 1])), exp[0])
+            assert r.read(l, 1).shape == (6, D)
+        # each call was encoded on its own; the stitched sequence is the concatenation of those encodings
+        parts = [rc.encode(reference(lm, toks[:, :3]), spec)[1]] + [rc.encode(reference(lm, toks[:, t: t + 1]), spec)[1] for t in range(3, 6)]
+        exp = torch.cat(parts, 2)
+        assert torch.equal(torch.stack(r.read(0, [0, 1])), exp[0]) and torch.equal(torch.stack(r.read(2, [0, 1])), exp[2])
 
 
-def test_inline_generation_keeps_per_call_chunks(lm, tmp_path):
+def test_generation_keeps_per_call_chunks(lm, tmp_path):
     stem = str(tmp_path / "geninl")
     toks = torch.randint(0, V, (1, 5))
-    with Sink(stem, layers_of(lm), "bf16", encode="inline") as sink:
+    with Sink(stem, layers_of(lm), "bf16") as sink:
         lm(toks[:, :2])
         lm(toks[:, 2:3])
         lm(toks[:, 3:4])
@@ -116,7 +111,7 @@ def test_without_root_module(lm, tmp_path):
         lm(toks[:2])
     with rc.open(str(tmp_path / "c")) as r:
         assert r.layers == [0, 2] and r.n_seq == 5 and r.tokens(0) is None
-        assert torch.equal(r.read(2, 4), reference(lm, toks[:2], (0, 2))[1, 1])   # bf16 staging, then fp16: exact
+        assert torch.equal(r.read(2, 4), reference(lm, toks[:2], (0, 2))[1, 1].half().float())
 
 
 def test_buffer_limit_forces_flush(lm, tmp_path):
@@ -128,6 +123,16 @@ def test_buffer_limit_forces_flush(lm, tmp_path):
             assert r.n_seq == 4
         lm(toks[:1])
     assert rc.open(str(tmp_path / "d")).n_seq == 5
+
+
+def test_nothing_written_before_flush(lm, tmp_path):
+    toks = torch.randint(0, V, (4, 8))
+    with Sink(str(tmp_path / "d2"), layers_of(lm), "bf16") as sink:
+        lm(toks)
+        assert sink.stats()["chunks"] == 0 and sink.stats()["buffered_bytes"] > 0
+        sink.flush()
+        assert sink.stats()["chunks"] == 1 and sink.stats()["buffered_bytes"] == 0
+    assert rc.open(str(tmp_path / "d2")).n_seq == 4
 
 
 def test_hooks_removed_on_exit(lm, tmp_path):
@@ -161,8 +166,6 @@ def test_extract_tokens_generic():
 
 
 def test_bad_args(lm, tmp_path):
-    with pytest.raises(ValueError):
-        Sink(str(tmp_path / "x"), layers_of(lm), "bf16", encode="gpu")
     with pytest.raises(ValueError):
         Sink(str(tmp_path / "x"), {}, "bf16")
     with pytest.raises(ValueError):

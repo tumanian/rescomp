@@ -8,7 +8,7 @@ reconstructions back into a model, KL, coherence) is a separate regime and must 
 
 ```python
 rec = rc.Sink("run1", layers=rc.hf_layers(model, [8, 9, 10, 11]),   # module objects to hook; helpers for HF/TL
-                  spec="int4_g384+layerK4+out12", encode="cpu",            # or encode="inline"
+                  spec="int4_g384+layerK4+out12",
                   tokens=None)                                             # None: a pre-hook captures input ids
 with rec:                                   # registers forward hooks on the given modules
     model(**batch)                          # one forward call = one chunk
@@ -22,19 +22,19 @@ rec.stats()                                 # chunks, sequences, bytes, ratio, p
 - **Tokens are optional.** Given explicitly (`rec.tokens(ids)` before a forward, or `tokens=` at init for a fixed
   set) or, when not given, taken by a forward pre-hook on the top-level model (`input_ids` keyword or first
   positional argument; a one-line extractor for custom models). The attention mask is taken the same way.
-- **Where to encode is the user's choice at initialization.**
-  - `encode="inline"`: the closed-loop encoder runs in the hook on the model's device; lowest memory, adds
-    latency to the model.
-  - `encode="cpu"` (offline): hooks copy raw bf16 activations to a staging buffer and return; encoding happens
-    at `flush()`, so the model runs at full speed and encoding never competes with the forward pass. Outlier
-    calibration uses the first `calib_seqs` buffered sequences. A byte limit on the buffer forces a flush.
+- **Quantize on the device, compress and write off the hot path** (decided 2026-10-18 after a first version
+  that staged raw bf16 on the CPU). Quantization is a map-and-reduce over the activations and belongs on the GPU
+  with the forward pass; the hook runs it, starts asynchronous copies of the encoded streams (4-5x smaller than
+  raw) to pinned host memory and returns without synchronizing. zstd and the file writes happen at `flush()`
+  (forced by a host-buffer limit and at close). Budget: under 1% of forward latency; `scripts/sink_overhead.py`
+  measures it. Outlier calibration uses the first call.
 - **File rotation at a size limit**, large (default 4 GB per tensor file): `run1.00000.rsc`, `run1.00001.rsc`, ...
   The index records which file each blob lives in.
 - **Generation is handled on read, not on write.** With the KV cache each step yields `[B, 1, d]`. Every chunk
   carries a sequence id and a start position; the reader concatenates the chunks of a sequence. A call with more
   than one token and no cache starts a new sequence, a one-token call with a cache continues it (read off the call's
-  arguments by the pre-hook). Inline mode encodes per call (small blobs compress ~10-20% worse); CPU mode groups
-  slices by sequence at flush and gets the compact layout for free. Sequence length is per chunk.
+  arguments by the pre-hook). Each call is encoded on its own (small one-token blobs compress ~10-20% worse than a merged
+  sequence would); the reader concatenates. Sequence length is per chunk.
 
 ## Storage layout (format version 2)
 
