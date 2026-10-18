@@ -39,6 +39,7 @@ def main():
     ap.add_argument("--seq-len", type=int, default=256)
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--dtype", default="bfloat16")
+    ap.add_argument("--compile", action="store_true")
     a = ap.parse_args()
     model, tok = load_model(a.model, dtype=a.dtype)
     dev = model.get_input_embeddings().weight.device
@@ -55,7 +56,8 @@ def main():
         res = {}
         for fid in (False, True):
             with tempfile.TemporaryDirectory() as d:
-                sink = rc.Sink(f"{d}/ov", rc.hf_layers(model, a.layers, tok), a.spec, buffer_bytes=1 << 40, fidelity=fid)
+                sink = rc.Sink(f"{d}/ov", rc.hf_layers(model, a.layers, tok), a.spec, buffer_bytes=1 << 40, fidelity=fid,
+                               compile=a.compile)
                 with sink:
                     timed(run, 3, sync)
                     if cuda:
@@ -66,7 +68,7 @@ def main():
                     sink.flush()
                     res[fid] = (statistics.median(hooked), time.perf_counter() - t, sink.stats(), peak)
     c = statistics.median(clean)
-    print(f"{a.model} layers {a.layers} spec {a.spec} batch {a.batch}x{a.seq_len} on {dev}")
+    print(f"{a.model} layers {a.layers} spec {a.spec} batch {a.batch}x{a.seq_len} on {dev}{' (compiled quantizer)' if a.compile else ''}")
     print(f"clean forward            {c * 1000:8.1f} ms (median of {a.iters}); peak GPU memory {peak_clean / 2**30:.2f} GiB")
     for fid, (h, flush, st, peak) in res.items():
         print(f"with sink, fidelity={str(fid):5s} {h * 1000:8.1f} ms  -> overhead {100 * (h - c) / c:+.2f}%; "

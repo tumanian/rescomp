@@ -82,9 +82,30 @@ def _reconstruct(streams, q, spec, O):
     return vhat
 
 
+def _quantize_values(v, q, reconstruct):
+    """The pure tensor work of one layer: scales, codes and (optionally) the dequantized values. Kept free of
+    Python state so it can be torch.compile'd into a few fused kernels."""
+    S = Q.make_scales(v, q)
+    codes = Q.quantize(v, S, q)
+    vhat = Q.dequantize(codes, S, q) if reconstruct else None
+    return S, codes, vhat
+
+
+_COMPILED = {}
+
+
+def quantize_values(v, q, reconstruct, compile=False):
+    if not compile:
+        return _quantize_values(v, q, reconstruct)
+    fn = _COMPILED.get("fn")
+    if fn is None:
+        fn = _COMPILED["fn"] = torch.compile(_quantize_values, dynamic=True)
+    return fn(v, q, reconstruct)
+
+
 class _Walker:
-    def __init__(self, spec, calib, n_layers):
-        self.spec, self.n_layers = Spec.parse(spec), n_layers
+    def __init__(self, spec, calib, n_layers, compile=False):
+        self.spec, self.n_layers, self.compile = Spec.parse(spec), n_layers, compile
         self.calib = calib if calib is not None else Calib(None, "none")
         self.calib.check(self.spec, n_layers)
         self.d = None
@@ -141,15 +162,18 @@ class Encoder(_Walker):
         if O is not None:
             streams["outliers"] = v[..., O].to(torch.bfloat16)
             v[..., O] = 0
-        S = Q.make_scales(v, q)
+        needed = reconstruct or (spec.K > 1 and not spec.is_key(i + 1) and i + 1 < self.n_layers)
+        S, codes, vhat = quantize_values(v, q, needed, self.compile)
         for j, s in enumerate(S):
             streams[f"scale{j}"] = s
-        streams["codes"] = Q.quantize(v, S, q)
-        needed = reconstruct or (spec.K > 1 and not spec.is_key(i + 1) and i + 1 < self.n_layers)
+        streams["codes"] = codes
         if not needed:
             self.prev = None
             return streams, None
-        vhat = _reconstruct(streams, q, spec, O)
+        if O is not None:
+            vhat[..., O] = streams["outliers"].float()
+        if spec.sink:
+            vhat[:, : spec.sink, :] = streams["sink"].float()
         xhat = vhat if key else self.prev.to(x.device) + vhat
         self.prev = xhat
         return streams, xhat

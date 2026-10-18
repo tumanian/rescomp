@@ -69,11 +69,12 @@ def _first(o):
 
 class Sink:
     def __init__(self, stem, layers, spec, *, tokens=None, calib=None, buffer_bytes=1 << 30, rotate_bytes=None,
-                 level=3, site="resid_post", extra=None, model_info=None, fidelity=False,
+                 level=3, site="resid_post", extra=None, model_info=None, fidelity=False, compile=False,
                  bucket=None, prefix=None, s3=None):
         """stem: a local path stem, an s3://bucket/prefix/name URI, or a name with bucket= and prefix= (see
         rescomp.storage). fidelity=True also measures each layer's reconstruction error in the hook (an extra
-        reconstruction and three reductions per layer, in fp32): useful once, costly on every forward."""
+        reconstruction and three reductions per layer, in fp32): useful once, costly on every forward.
+        compile=True runs the quantizer through torch.compile (fused kernels; a one-time compile per shape class)."""
         if tokens not in (None, "off"):
             raise ValueError("tokens must be None (pre-hook) or 'off'")
         self._spec_arg = spec
@@ -84,7 +85,7 @@ class Sink:
         if not self.order:
             raise ValueError("no layers to hook")
         self.record_tokens = tokens is None
-        self.fidelity = fidelity
+        self.fidelity, self.compile = fidelity, compile
         self.calib = calib
         self.buffer_bytes, self.site = buffer_bytes, site
         info = dict(L.model_info)
@@ -262,7 +263,7 @@ class Sink:
             elif self.spec.outliers:
                 self.calib.check(self.spec, len(self.order))
                 self.store.calib = self.calib
-            self.enc = Encoder(self.spec, self.calib, len(self.order))
+            self.enc = Encoder(self.spec, self.calib, len(self.order), compile=self.compile)
         self.enc.reset()
 
     def _calibrate_layer(self, i, x):

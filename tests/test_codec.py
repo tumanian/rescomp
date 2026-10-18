@@ -146,3 +146,21 @@ def test_works_on_bf16_input_and_other_batch_sizes():
     st, xh = rc.encode(x, spec, cal)
     assert torch.equal(rc.decode(st, spec, cal), xh)
 
+
+
+def test_compiled_quantizer_matches_eager(acts):
+    """torch.compile must not change the bytes (same ops, fused). CUDA only: inductor's CPU backend needs a
+    working OpenMP C++ toolchain, which the development Macs do not have."""
+    if not torch.cuda.is_available():
+        pytest.skip("compiled quantizer is checked on CUDA")
+    spec = rc.Spec.parse("int4_g16+layerK2+out2")
+    cal = rc.calibrate(acts, spec)
+    eager, xe = rc.encode(acts, spec, cal)
+    enc = Encoder(spec, cal, acts.shape[0], compile=True)
+    comp, xc = [], []
+    for i in range(acts.shape[0]):
+        s, x = enc.encode_layer(i, acts[i])
+        comp.append(s)
+        xc.append(x)
+    assert torch.equal(torch.stack(xc), xe)
+    assert all(torch.equal(eager[i][k], comp[i][k]) for i in range(len(eager)) for k in eager[i])
