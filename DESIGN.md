@@ -1,4 +1,4 @@
-# Design: the recorder (next step, not built yet)
+# Design: the sink (next step, not built yet)
 
 Decisions taken 2026-10-18. This replaces the "capture wraps the model" API: the production flow is
 *initialize once (hooks), run the model untouched, look at what is stored*. Instrumentation (patching
@@ -7,7 +7,7 @@ reconstructions back into a model, KL, coherence) is a separate regime and must 
 ## Production flow
 
 ```python
-rec = rc.Recorder("run1", layers=rc.hf_layers(model, [8, 9, 10, 11]),   # module objects to hook; helpers for HF/TL
+rec = rc.Sink("run1", layers=rc.hf_layers(model, [8, 9, 10, 11]),   # module objects to hook; helpers for HF/TL
                   spec="int4_g384+layerK4+out12", encode="cpu",            # or encode="inline"
                   tokens=None)                                             # None: a pre-hook captures input ids
 with rec:                                   # registers forward hooks on the given modules
@@ -56,7 +56,7 @@ Dependency: `pyarrow`.
 
 `rescomp.instrument`: a `Patcher` that hooks the same modules and replaces their outputs with reconstructions
 (from a file, or live through the encoder), plus the measurements that exist today (file / per-layer / live KL,
-perplexity ratio, generation coherence). Uses the same module-object convention as the recorder; the
+perplexity ratio, generation coherence). Uses the same module-object convention as the sink; the
 `ModelAdapter` protocol goes away once this exists.
 
 ## Open points
