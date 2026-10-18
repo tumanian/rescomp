@@ -60,6 +60,25 @@ Dependency: `pyarrow`.
 perplexity ratio, generation coherence). Uses the same module-object convention as the sink; the
 `ModelAdapter` protocol goes away once this exists.
 
+## Measured overhead (A10G, 2026-10-18)
+
+`scripts/sink_overhead.py`, median forward time with and without the sink attached, buffer never flushed during
+the timed passes, peak GPU memory from the allocator. The sink does the quantizer kernels in the hook and
+nothing else; zstd and the writes happen at flush (3.2 s for 13 Qwen3-8B chunks, 0.5 GB).
+
+| Model, batch | regime | forward | with sink | with sink, compiled quantizer | peak GPU memory added |
+|---|---|---|---|---|---|
+| GPT-2, 16 x 256, layers 8-11 | compact | 35.7 ms | +30% | +24% | +150 MiB |
+| Qwen3-8B, 4 x 512, layers 24-35 | compact | 609 ms | +5.8% | +3.5% | +650 MiB (buffered streams, capped by `buffer_bytes`) |
+| Qwen3-8B, 4 x 512, layers 24-35 | faithful | 609 ms | +5.6% | +2.4% | +1.25 GiB (same) |
+| Qwen3-8B, 4 x 512, layers 24-35 | exact | 609 ms | +2.2% | - | +2.5 GiB (same) |
+
+`fidelity=True` adds about 2 points. The budget is 1%; what remains is per-layer fixed cost (Python in the
+hook, the outlier gather/scatter, kernel launches, dynamo guards), about 1.8 ms per hooked layer on Qwen3-8B
+and 2 ms on GPT-2, so small models that run a forward in tens of milliseconds pay the most. Next step: profile
+one hooked layer with torch.profiler and fold the remaining ops into the compiled function (outlier handling,
+the fp32 cast, the delta), or write the quantizer as one Triton kernel.
+
 ## Bytes and devices
 
 The codec (version 2) is pinned to torchao's numerics. Encoding the same activations on a GPU and on the CPU gives

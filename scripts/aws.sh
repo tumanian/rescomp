@@ -22,7 +22,7 @@ if [ "$BOX" = main ]; then ID=${BOX_ID:-i-02b17b44a3cb0641f}; else ID=$(cat "$ST
 KEY=$HOME/.ssh/sae-cpu.pem
 ip() { cat "$STATE.ip"; }
 SSH() { ssh -i "$KEY" -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 ubuntu@"$(ip)" "$@"; }
-push() { rsync -az -e "ssh -i $KEY -o StrictHostKeyChecking=accept-new" --exclude .venv --exclude results --include 'tests/data/*.rsc' --exclude '*.rsc' \
+push() { rsync -az --delete -e "ssh -i $KEY -o StrictHostKeyChecking=accept-new" --exclude .venv --exclude results --include 'tests/data/*.rsc' --exclude '*.rsc' \
            --exclude __pycache__ --exclude .pytest_cache --exclude 'scripts/.box*' "$HERE/" "ubuntu@$(ip):rescomp/"; }
 cmd=$1; shift
 case $cmd in

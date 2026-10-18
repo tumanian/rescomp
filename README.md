@@ -46,7 +46,9 @@ r.tokens(2); r.header["model"]; r.header["layers"][1]["fidelity"]
 - Each layer's hook quantizes that layer on the model's device (cheap kernels) and keeps the encoded streams
   there; the model frees its activations as usual. `sink.flush()` moves the streams to the host, runs zstd and
   writes; it is forced when the on-device buffer passes `buffer_bytes` (1 GiB default) and at close.
-  `scripts/sink_overhead.py` measures the added forward time and peak GPU memory.
+  Measured on an A10G (`scripts/sink_overhead.py`): Qwen3-8B with 12 hooked layers runs 2.4-5.8% slower
+  (`compile=True` gives the lower numbers) with about 150 MiB of working memory plus the buffered streams;
+  GPT-2 small, whose forward is only 36 ms, 24-30% slower. DESIGN.md has the table and the path to under 1%.
 - Tokens: taken from each call by a pre-hook on the root model (`input_ids`, `attention_mask`, and the KV-cache
   signal that tells a generation step from a new prompt); `sink.tokens(ids)` overrides, `tokens="off"` disables.
 - `sink.annotate(doc_id=[...], split="train")` labels the sequences the next new-sequence call starts; labels become
