@@ -70,4 +70,7 @@ any device returns exactly the reconstruction the encoder computed on the device
 ## Status
 
 Built as designed: defaults are 4 GB rotation and 2 GB staging buffer; the offline mode encodes on flush only;
-`rc.open()` reads both the format-2 stem and the single-file RSC1 format. Not done: a background encoder thread.
+`rc.open()` reads both the format-2 stem and the single-file RSC1 format. Not done: a background encoder thread; object storage. The store writes to the local disk only. S3 would fit the
+layout (each rotated tensor file is immutable once closed and could be uploaded at rotation; the Parquet tables
+are small whole-file rewrites; the reader's blob fetches are offset-plus-length reads, i.e. range requests), via
+pyarrow's filesystem layer. Until then: write locally, sync the stem's files afterwards.

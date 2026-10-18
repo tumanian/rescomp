@@ -166,8 +166,9 @@ def test_corruption_detected(tmp_path):
 
 
 def test_parquet_schema(tmp_path):
-    stem = str(tmp_path / "s")
-    write_store(stem)
+    from rescomp.storage import location
+    stem = location(str(tmp_path / "s"))
+    write_store(stem.path)
     t = pq.read_table(S.table_path(stem, "tokens"))
     assert t.column_names == ["seq_id", "n_tokens", "tokens", "mask", "doc_id", "tag", "vec"]
     assert t.schema.field("tokens").type == pa.list_(pa.int32()) and t.schema.field("vec").type == pa.list_(pa.int64())

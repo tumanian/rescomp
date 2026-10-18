@@ -11,7 +11,7 @@ dependencies = ["torch>=2.8", "numpy>=1.24", "zstandard>=0.21", "pyarrow>=15", "
 
 [project.optional-dependencies]
 hf = ["transformers>=4.56", "datasets>=2.18"]   # 4.56: from_pretrained(dtype=)
-test = ["pytest>=7", "pytest-cov", "transformers>=4.56"]
+test = ["pytest>=7", "pytest-cov", "transformers>=4.56", "moto[server]>=5", "boto3"]
 
 [project.scripts]
 rescomp = "rescomp.cli:main"

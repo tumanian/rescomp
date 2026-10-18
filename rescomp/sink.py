@@ -68,10 +68,12 @@ def _first(o):
 
 
 class Sink:
-    def __init__(self, stem, layers, spec, *, tokens=None, calib=None, buffer_bytes=1 << 30, rotate_bytes=4 << 30,
-                 level=3, site="resid_post", extra=None, model_info=None, fidelity=False):
-        """fidelity=True also measures each layer's reconstruction error in the hook (an extra reconstruction
-        and three reductions per layer, in fp32): useful once, costly on every forward."""
+    def __init__(self, stem, layers, spec, *, tokens=None, calib=None, buffer_bytes=1 << 30, rotate_bytes=None,
+                 level=3, site="resid_post", extra=None, model_info=None, fidelity=False,
+                 bucket=None, prefix=None, s3=None):
+        """stem: a local path stem, an s3://bucket/prefix/name URI, or a name with bucket= and prefix= (see
+        rescomp.storage). fidelity=True also measures each layer's reconstruction error in the hook (an extra
+        reconstruction and three reductions per layer, in fp32): useful once, costly on every forward."""
         if tokens not in (None, "off"):
             raise ValueError("tokens must be None (pre-hook) or 'off'")
         self._spec_arg = spec
@@ -89,7 +91,8 @@ class Sink:
         info.update(model_info or {})
         info.setdefault("n_layers", L.n_layers)
         self.store = Store(stem, model=info, layers=self.order, spec=self.spec, calib=calib, site=site, level=level,
-                           hook_names=L.hook_names, extra=dict(extra or {}), rotate_bytes=rotate_bytes)
+                           hook_names=L.hook_names, extra=dict(extra or {}), rotate_bytes=rotate_bytes,
+                           bucket=bucket, prefix=prefix, s3=s3)
         self.store.regime = spec if is_regime(spec) else None
         self.enc = None
         self._handles = []

@@ -1,4 +1,4 @@
-"""Storage, format version 2: tensors apart from metadata.
+"""Storage, format version 2: tensors apart from metadata, on the local disk or in S3 (see rescomp.storage).
 
     <stem>.00000.rsc, <stem>.00001.rsc, ...   append-only files of compressed tensor blobs, rotated at a size limit
     <stem>.meta.parquet                        one row: model, spec, calibration, stored layers, fidelity, byte counts
@@ -30,46 +30,48 @@ from ._version import __version__
 from .codec import Calib, Decoder, Encoder, calibrate
 from .quant import CODEC_VERSION
 from .spec import Spec
+from .storage import Location, location
 
 MAGIC2 = b"RSC2"
 VERSION2 = 2
 HEAD2 = len(MAGIC2) + 4
 
 
-def table_path(stem, name):
-    return f"{stem}.{name}.parquet"
+def table_path(loc, name):
+    return f"{loc.path}.{name}.parquet"
 
 
-def blob_path(stem, n):
-    return f"{stem}.{n:05d}.rsc"
+def blob_path(loc, n):
+    return f"{loc.path}.{n:05d}.rsc"
 
 
-def is_v2(stem):
-    return os.path.exists(table_path(stem, "meta"))
+def is_v2(stem, bucket=None, prefix=None, s3=None):
+    loc = stem if isinstance(stem, Location) else location(stem, bucket, prefix, s3)
+    return loc.exists(table_path(loc, "meta"))
 
 
 # ---------------------------------------------------------------- blob files
 
 class BlobFiles:
-    """Append-only tensor files with rotation. append(tensor) -> blob record; the record says which file."""
+    """Append-only tensor files with rotation. append(tensor) -> blob record; the record says which file.
+    On a remote filesystem flush() closes the current file (an object is only readable once complete) and the
+    next append starts a new one."""
 
-    def __init__(self, stem, rotate_bytes=4 << 30, level=3, shuffle=True, start_file=0, start_offset=None):
-        self.stem, self.rotate_bytes, self.level, self.shuffle = str(stem), int(rotate_bytes), level, shuffle
-        self.n = start_file
+    def __init__(self, loc, rotate_bytes=None, level=3, shuffle=True):
+        self.loc, self.level, self.shuffle = loc, level, shuffle
+        self.rotate_bytes = int(rotate_bytes or loc.rotate_default)
+        self.n = -1
         self.f = None
         self.pos = 0
-        if start_offset is not None:                     # reopen an existing last file for appending
-            self.f = open(blob_path(self.stem, self.n), "r+b")
-            self.f.seek(start_offset)
-            self.pos = start_offset
+        self.files = []
 
     def _open_new(self):
-        if self.f:
-            self.f.close()
-            self.n += 1
-        self.f = open(blob_path(self.stem, self.n), "wb")
+        self.close()
+        self.n += 1
+        self.f = self.loc.fs.open_output_stream(blob_path(self.loc, self.n))
         self.f.write(MAGIC2 + struct.pack("<I", VERSION2))
         self.pos = HEAD2
+        self.files.append(blob_path(self.loc, self.n))
 
     def append(self, t):
         t = t.detach() if isinstance(t, torch.Tensor) else torch.as_tensor(np.asarray(t))
@@ -83,17 +85,17 @@ class BlobFiles:
         return rec
 
     def flush(self):
-        if self.f:
+        if self.f is None:
+            return
+        if self.loc.remote:
+            self.close()                                 # finalize the object; the next append opens a new one
+        else:
             self.f.flush()
 
     def close(self):
-        if self.f:
+        if self.f is not None:
             self.f.close()
             self.f = None
-
-    @property
-    def files(self):
-        return [blob_path(self.stem, i) for i in range(self.n + 1) if os.path.exists(blob_path(self.stem, i))]
 
 
 # ---------------------------------------------------------------- annotations <-> arrow
@@ -129,10 +131,12 @@ class Store:
     """Format-2 writer. Give it encoded chunks and per-sequence tokens; call flush() to make the files readable."""
 
     def __init__(self, stem, *, model, layers, spec=None, calib=None, site="resid_post", level=3, shuffle=True,
-                 hook_names=None, extra=None, rotate_bytes=4 << 30):
-        """spec may be None at construction (a regime that needs the model width) and set with set_spec()
-        before the first chunk."""
-        self.stem = str(stem)
+                 hook_names=None, extra=None, rotate_bytes=None, bucket=None, prefix=None, s3=None):
+        """stem: a local path stem, an s3://bucket/prefix/name URI, or a name with bucket= and prefix=.
+        spec may be None at construction (a regime that needs the model width) and set with set_spec()
+        before the first chunk. rotate_bytes defaults to 4 GiB locally and 1 GiB on S3."""
+        self.loc = location(stem, bucket, prefix, s3)
+        self.stem = self.loc.uri
         self.spec = None if spec is None else Spec.parse(spec)
         self.layers = [int(l) for l in layers]
         if not self.layers or self.layers != sorted(set(self.layers)):
@@ -146,8 +150,8 @@ class Store:
         self.extra = dict(extra or {})
         self.regime = None               # the regime name this spec came from, if any
         json.dumps({"model": self.model, "hook_names": self.hook_names, "extra": self.extra})
-        os.makedirs(os.path.dirname(os.path.abspath(self.stem)), exist_ok=True)
-        self.blobs = BlobFiles(self.stem, rotate_bytes, level, shuffle)
+        self.loc.ensure_dir()
+        self.blobs = BlobFiles(self.loc, rotate_bytes, level, shuffle)
         self.seq = {}                    # seq_id -> {"tokens": list[int] | None, "mask": list[int] | None, "ann": {}}
         self.d = None
         L = len(self.layers)
@@ -240,7 +244,7 @@ class Store:
                                         "max_abs": float(self.maxabs.max()) if self.n_measured else None,
                                         "measured_chunks": self.n_measured}),
                 "extra": json.dumps(self.extra), "n_sequences": len(self.seq), "n_chunks": len(self.chunk_rows),
-                "n_tokens": int(n_tok), "n_files": len(self.blobs.files),
+                "n_tokens": int(n_tok), "n_files": len(self.blobs.files), "location": self.loc.uri,
                 "bytes": json.dumps({"activations_raw_bf16": self.act_raw, "activations_stored": self.act_stored,
                                      "ratio_vs_bf16": (self.act_raw / self.act_stored) if self.act_stored else None}),
                 "seconds": round(time.time() - self.t0, 2)}
@@ -263,13 +267,14 @@ class Store:
     def flush(self):
         """Write the four tables (whole, every time) so the files are readable now."""
         self.blobs.flush()
-        pq.write_table(pa.table({k: [v] for k, v in self._meta().items()}), table_path(self.stem, "meta"))
+        fs = self.loc.fs
+        pq.write_table(pa.table({k: [v] for k, v in self._meta().items()}), table_path(self.loc, "meta"), filesystem=fs)
         pq.write_table(pa.table({
             "chunk": pa.array([c["chunk"] for c in self.chunk_rows], pa.int64()),
             "seq_ids": pa.array([c["seq_ids"] for c in self.chunk_rows], pa.list_(pa.int64())),
             "starts": pa.array([c["starts"] for c in self.chunk_rows], pa.list_(pa.int32())),
             "n_tokens": pa.array([c["n_tokens"] for c in self.chunk_rows], pa.int32()),
-            "n_seq": pa.array([c["n_seq"] for c in self.chunk_rows], pa.int32())}), table_path(self.stem, "chunks"))
+            "n_seq": pa.array([c["n_seq"] for c in self.chunk_rows], pa.int32())}), table_path(self.loc, "chunks"), filesystem=fs)
         b = self.blob_rows
         pq.write_table(pa.table({
             "chunk": pa.array([r["chunk"] for r in b], pa.int64()), "layer": pa.array([r["layer"] for r in b], pa.int32()),
@@ -277,8 +282,8 @@ class Store:
             "offset": pa.array([r["offset"] for r in b], pa.int64()), "nbytes": pa.array([r["nbytes"] for r in b], pa.int64()),
             "raw_nbytes": pa.array([r["raw_nbytes"] for r in b], pa.int64()),
             "crc32": pa.array([r["crc32"] for r in b], pa.int64()), "dtype": pa.array([r["dtype"] for r in b], pa.string()),
-            "shape": pa.array([r["shape"] for r in b], pa.list_(pa.int32()))}), table_path(self.stem, "blobs"))
-        pq.write_table(self._tokens_table(), table_path(self.stem, "tokens"))
+            "shape": pa.array([r["shape"] for r in b], pa.list_(pa.int32()))}), table_path(self.loc, "blobs"), filesystem=fs)
+        pq.write_table(self._tokens_table(), table_path(self.loc, "tokens"), filesystem=fs)
 
     def stats(self):
         m = self._meta()
@@ -305,11 +310,13 @@ class Store:
 # ---------------------------------------------------------------- reader
 
 class Reader:
-    def __init__(self, stem, verify=True):
-        self.stem, self.verify = str(stem), verify
-        if not is_v2(self.stem):
-            raise ValueError(f"{self.stem}: no {table_path(self.stem, 'meta')} (a capture is opened by its stem)")
-        m = pq.read_table(table_path(self.stem, "meta")).to_pylist()[0]
+    def __init__(self, stem, verify=True, bucket=None, prefix=None, s3=None):
+        self.loc = location(stem, bucket, prefix, s3)
+        self.stem, self.verify = self.loc.uri, verify
+        if not is_v2(self.loc):
+            raise ValueError(f"{self.stem}: no {os.path.basename(table_path(self.loc, 'meta'))} (a capture is opened by its stem)")
+        fs = self.loc.fs
+        m = pq.read_table(table_path(self.loc, "meta"), filesystem=fs).to_pylist()[0]
         self.meta = m
         self.header = dict(m, model=json.loads(m["model"]), calib=json.loads(m["calib"]), lossless=json.loads(m["lossless"]),
                            layers=json.loads(m["layers"]), fidelity=json.loads(m["fidelity"]), extra=json.loads(m["extra"]),
@@ -324,11 +331,11 @@ class Reader:
         self.layers = [l["layer"] for l in self.header["layers"]]
         self.d = m["d_model"]
         self.shuffle = self.header["lossless"]["shuffle"]
-        self.chunks = pq.read_table(table_path(self.stem, "chunks")).to_pylist()
+        self.chunks = pq.read_table(table_path(self.loc, "chunks"), filesystem=fs).to_pylist()
         self.blobs = defaultdict(dict)                   # (chunk, layer) -> stream -> record
-        for r in pq.read_table(table_path(self.stem, "blobs")).to_pylist():
+        for r in pq.read_table(table_path(self.loc, "blobs"), filesystem=fs).to_pylist():
             self.blobs[(r["chunk"], r["layer"])][r["stream"]] = r
-        self.tokens_table = pq.read_table(table_path(self.stem, "tokens"))
+        self.tokens_table = pq.read_table(table_path(self.loc, "tokens"), filesystem=fs)
         self._seq_rows = {r["seq_id"]: r for r in self.tokens_table.to_pylist()}
         self.n_seq = len(self._seq_rows)
         self.by_seq = defaultdict(list)                  # seq_id -> [(start, chunk, row)]
@@ -363,9 +370,8 @@ class Reader:
     def _read_blob(self, rec):
         f = self._files.get(rec["file"])
         if f is None:
-            f = self._files[rec["file"]] = open(blob_path(self.stem, rec["file"]), "rb")
-        f.seek(rec["offset"])
-        b = f.read(rec["nbytes"])
+            f = self._files[rec["file"]] = self.loc.fs.open_input_file(blob_path(self.loc, rec["file"]))
+        b = bytes(f.read_at(rec["nbytes"], rec["offset"]))         # on S3: one range request
         if len(b) != rec["nbytes"]:
             raise ValueError("truncated blob file")
         if self.verify and zlib.crc32(b) != rec["crc32"]:
@@ -469,12 +475,12 @@ class Reader:
 
 
 @torch.no_grad()
-def transcode(src, dst, spec, calib_seqs=32, level=3, rotate_bytes=4 << 30, extra=None):
+def transcode(src, dst, spec, calib_seqs=32, level=3, rotate_bytes=None, extra=None, src_loc=None, dst_loc=None):
     """Re-encode a stored capture with another spec, chunk by chunk, without the model. Meant for a lossless
     source (exact / bf16); the source spec and its measured error are recorded in the new header's extra.
-    Returns the new Store's stats."""
+    src_loc / dst_loc: {"bucket": ..., "prefix": ..., "s3": {...}} for either end. Returns the new Store's stats."""
     from .regimes import resolve
-    with Reader(src) as r:
+    with Reader(src, **(src_loc or {})) as r:
         spec = resolve(spec, r.d)
         calib = None
         if spec.outliers:
@@ -486,13 +492,13 @@ def transcode(src, dst, spec, calib_seqs=32, level=3, rotate_bytes=4 << 30, extr
                 chunks.append(c["chunk"])
                 seen.update(c["seq_ids"])
             sample = [torch.cat([r._decode_chunk(ci, i)[i].flatten(0, 1) for ci in chunks]) for i in range(len(r.layers))]
-            calib = calibrate(torch.stack(sample).unsqueeze(1), spec, source=f"first {len(seen)} sequences of {os.path.basename(src)}")
+            calib = calibrate(torch.stack(sample).unsqueeze(1), spec, source=f"first {len(seen)} sequences of {os.path.basename(r.stem)}")
         ex = dict(r.header["extra"])
-        ex.update({"transcoded_from": os.path.basename(src), "source_spec": r.spec.name,
+        ex.update({"transcoded_from": r.stem, "source_spec": r.spec.name,
                    "source_rel_l2": r.header["fidelity"]["rel_l2"]}, **(extra or {}))
         hooks = {l["layer"]: l["hook"] for l in r.header["layers"] if l.get("hook")}
         with Store(dst, model=r.header["model"], layers=r.layers, spec=spec, calib=calib, site=r.header["site"],
-                   level=level, hook_names=hooks, extra=ex, rotate_bytes=rotate_bytes) as st:
+                   level=level, hook_names=hooks, extra=ex, rotate_bytes=rotate_bytes, **(dst_loc or {})) as st:
             for row in r.tokens_table.to_pylist():
                 sid = row["seq_id"]
                 new = st.new_sequence(row["tokens"], row["mask"], **{k: row[k] for k in r.annotations})

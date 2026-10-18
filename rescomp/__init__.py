@@ -16,9 +16,10 @@ from .regimes import REGIMES, resolve as resolve_spec
 from .tl import tl_layers
 
 
-def open(path, verify=True):
-    """Open a stored capture by its stem (<stem>.meta.parquet + <stem>.NNNNN.rsc)."""
-    return Reader(path, verify=verify)
+def open(stem, verify=True, bucket=None, prefix=None, s3=None):
+    """Open a stored capture by its stem: a local path, an s3://bucket/prefix/name URI, or a name with bucket=
+    and prefix= (<stem>.meta.parquet + <stem>.NNNNN.rsc)."""
+    return Reader(stem, verify=verify, bucket=bucket, prefix=prefix, s3=s3)
 
 
 def hf_layers(model, layers, tokenizer=None, model_id=None, revision=None):

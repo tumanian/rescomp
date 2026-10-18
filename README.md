@@ -53,7 +53,19 @@ r.tokens(2); r.header["model"]; r.header["layers"][1]["fidelity"]
   Parquet columns.
 - Outlier channels (`+out`) are calibrated on the first chunk unless `calib=` is given.
 
-### Storage (format 2)
+### Storage (format 2), local or S3
+
+A capture lives under a stem: a local path (`runs/demo`), an `s3://bucket/prefix/demo` URI, or a name with
+`bucket=` and `prefix=`; `Sink`, `Store`, `rc.open`/`Reader` and `rc.transcode` all take these. S3 goes through
+pyarrow's own S3 filesystem (credentials from the usual environment, profile or instance role; `s3={...}` passes
+options such as `region` or `endpoint_override` for MinIO-style endpoints). On S3 each flush closes the current
+tensor object, so a capture is readable mid-run, and objects are capped at 1 GiB (4 GiB locally); the reader
+fetches blobs with range requests.
+
+```python
+with rc.Sink("demo", layers=..., spec="balanced", bucket="my-acts", prefix="team/qwen3-8b") as sink: ...
+r = rc.open("s3://my-acts/team/qwen3-8b/demo")
+```
 
 `<stem>.00000.rsc, ...` hold only the compressed tensor blobs (append-only, rotated at `rotate_bytes`, 4 GB by
 default). `<stem>.meta.parquet` has the model, spec, calibration, stored layers with hook names and measured
