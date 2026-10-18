@@ -43,9 +43,10 @@ r.tokens(2); r.header["model"]; r.header["layers"][1]["fidelity"]
 - `layers`: `rc.hf_layers(model, [...])` for Hugging Face, `rc.tl_layers(model, [...])` for TransformerLens, or
   any `{layer: nn.Module}` whose outputs are the residual stream (then pass `rc.Layers(modules=..., root=model)`
   if you want the token pre-hook).
-- The hook quantizes on the model's device (cheap kernels), starts asynchronous copies of the encoded streams to
-  pinned host memory and returns without synchronizing. zstd and the file writes run at `sink.flush()`, when the
-  host buffer passes `buffer_bytes`, and at close. `scripts/sink_overhead.py` measures the added forward time.
+- Each layer's hook quantizes that layer on the model's device (cheap kernels) and keeps the encoded streams
+  there; the model frees its activations as usual. `sink.flush()` moves the streams to the host, runs zstd and
+  writes; it is forced when the on-device buffer passes `buffer_bytes` (1 GiB default) and at close.
+  `scripts/sink_overhead.py` measures the added forward time and peak GPU memory.
 - Tokens: taken from each call by a pre-hook on the root model (`input_ids`, `attention_mask`, and the KV-cache
   signal that tells a generation step from a new prompt); `sink.tokens(ids)` overrides, `tokens="off"` disables.
 - `sink.annotate(doc_id=[...], split="train")` labels the sequences the next new-sequence call starts; labels become

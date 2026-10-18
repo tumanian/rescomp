@@ -11,10 +11,11 @@ takes its output (the residual stream after that layer). Tokens: given with `sin
 forward, or taken by a forward pre-hook on the root model (`input_ids` keyword or first positional argument);
 `tokens="off"` records none.
 
-What happens where: the hook quantizes on the model's device (cheap map-and-reduce work, closed-loop deltas
-included), starts asynchronous copies of the encoded streams to pinned host memory and returns without
-synchronizing; the slow parts, zstd and the file writes, run at flush() (also forced when the host buffer
-exceeds `buffer_bytes`, and at close). The forward pass pays only for the quantizer kernels and the copies.
+What happens where: each layer's hook quantizes that layer on the model's device as soon as it is produced
+(cheap map-and-reduce work, closed-loop deltas included) and returns; the encoded streams stay on the device,
+so the model frees its activations exactly as it would without the sink and the forward pass pays only for the
+quantizer kernels. flush() moves the encoded streams to the host, runs zstd and writes the files; it is also
+forced when the on-device buffer exceeds `buffer_bytes` (default 1 GiB), and at close.
 
 Sequences: a call with T > 1 tokens starts B new sequences; a call with T == 1 continues the B open ones when
 the model says it is using a cache (HF: past_key_values / cache_position) or, lacking that signal, when the
@@ -26,7 +27,7 @@ from typing import Callable, Dict, Optional
 
 import torch
 
-from .codec import Encoder, calibrate
+from .codec import Calib, Encoder
 from .regimes import is_regime, needs_width, resolve
 from .spec import Spec
 from .store import Store
@@ -67,7 +68,7 @@ def _first(o):
 
 
 class Sink:
-    def __init__(self, stem, layers, spec, *, tokens=None, calib=None, buffer_bytes=2 << 30, rotate_bytes=4 << 30,
+    def __init__(self, stem, layers, spec, *, tokens=None, calib=None, buffer_bytes=1 << 30, rotate_bytes=4 << 30,
                  level=3, site="resid_post", extra=None, model_info=None, fidelity=False):
         """fidelity=True also measures each layer's reconstruction error in the hook (an extra reconstruction
         and three reductions per layer, in fp32): useful once, costly on every forward."""
@@ -97,6 +98,7 @@ class Sink:
         self._pending_ann = {}
         self._open, self._len = [], {}    # open sequence ids and their current lengths
         self._buffer, self._buffered = [], 0     # encoded chunks waiting for zstd + write
+        self._calibrating = False
         self.n_calls = self.n_incomplete = 0
         self.t0 = time.time()
 
@@ -117,7 +119,7 @@ class Sink:
 
     def stats(self):
         s = self.store.stats()
-        s.update(calls=self.n_calls, incomplete_calls=self.n_incomplete, buffered_bytes=self._buffered,
+        s.update(calls=self.n_calls, incomplete_calls=self.n_incomplete, buffered_bytes=self._buffered,   # on the device
                  seconds=round(time.time() - self.t0, 1))
         return s
 
@@ -157,29 +159,47 @@ class Sink:
                               mask=None if mask is None else mask.detach().cpu(), cont=cont)
 
     def _begin_call(self):
-        if self._call is not None and self._call["acts"]:
+        if self._call is not None and self._call["streams"]:
             self.n_incomplete += 1                     # a previous call never reached the last stored layer
-        self._call = {"acts": {}, "ids": None, "mask": None, "cont": None, "given": False}
+        self._call = {"streams": {}, "err": {}, "shape": None, "ids": None, "mask": None, "cont": None, "given": False}
         if self._given is not None:
             self._call["ids"], self._call["mask"] = self._given
             self._call["given"] = True
             self._given = None
 
     def _layer_hook(self, l, x):
-        if self._call is None or (l == self.order[0] and self._call["acts"]):
+        """Encode this layer now, on its device, so the model can free the activation as usual."""
+        if self._call is None or (l == self.order[0] and self._call["streams"]):
             self._begin_call()                         # no root pre-hook: the first stored layer opens a call
-        self._call["acts"][l] = x.detach()
+        x = x.detach()
+        i = self.order.index(l)
+        if i == 0:
+            self._call["shape"] = tuple(x.shape)
+            self._encoder_for(x)
+        if self._call["shape"] is None or tuple(x.shape) != self._call["shape"]:
+            return                                     # a layer fired without the first one (or shapes changed): drop the call
+        if self._calibrating:
+            self._calibrate_layer(i, x)
+        st, xhat = self.enc.encode_layer(i, x, reconstruct=self.fidelity)
+        if self.fidelity:
+            xf = x.float()
+            e = xf - xhat
+            # fp32 and kept on the device as a 0-d tensor: reducing to Python here would synchronize
+            self._call["err"][l] = torch.stack([e.pow(2).sum(), xf.pow(2).sum(), e.abs().max()])
+        self._call["streams"][l] = st                   # stays on the device until flush
         if l == self.order[-1]:
-            self._complete_call()
+            if self._calibrating:
+                self._calibrating = False
+                self.store.calib = self.calib
+            self._complete_call(x.device)
 
     # -- a complete forward call
-    def _complete_call(self):
+    def _complete_call(self, dev):
         call, self._call = self._call, None
-        acts = [call["acts"][l] for l in self.order]
-        if any(a is None for a in acts) or len(call["acts"]) != len(self.order):
+        if len(call["streams"]) != len(self.order):
             self.n_incomplete += 1
             return
-        B, T, d = acts[0].shape
+        B, T, d = call["shape"]
         self.n_calls += 1
         cont = call["cont"]
         if cont is None:
@@ -203,8 +223,11 @@ class Sink:
             self._open = seq_ids
         for s in seq_ids:
             self._len[s] = self._len.get(s, 0) + T
-        self.store.note_raw(B * T * d * 2 * len(acts), d)
-        self._encode_call(seq_ids, starts, acts)
+        self.store.note_raw(B * T * d * 2 * len(self.order), d)
+        streams = [call["streams"][l] for l in self.order]
+        err = torch.stack([call["err"][l] for l in self.order]) if self.fidelity else None
+        self._buffer.append((list(seq_ids), list(starts), streams, err))
+        self._buffered += sum(t.numel() * t.element_size() for st in streams for t in st.values())
         if self._buffered >= self.buffer_bytes:
             self.flush()
 
@@ -221,52 +244,32 @@ class Sink:
         return out
 
     # -- encoding (in the hook, on the model's device)
-    def _encoder(self, acts):
+    def _encoder_for(self, x0):
+        """Resolve the spec on the first call's first layer and reset the encoder per call. Without a given
+        calibration, the first call calibrates each layer's outlier channels in that layer's own hook, from what
+        the encoder is about to quantize (x at keyframes, x - xhat_prev at delta layers)."""
         if self.enc is None:
             if self.spec is None:
-                self.spec = resolve(self._spec_arg, acts[0].shape[-1])
+                self.spec = resolve(self._spec_arg, x0.shape[-1])
                 self.store.set_spec(self.spec)
             if self.calib is None and self.spec.outliers:
-                self.calib = calibrate(torch.stack([a.float() for a in acts]), self.spec, source="first_chunk")
-            if self.spec.outliers:
+                n, L = self.spec.outliers, len(self.order)
+                self.calib = Calib(torch.arange(n).repeat(L, 1), source="first_call")   # placeholder rows, filled per layer
+                self._calibrating = True
+            elif self.spec.outliers:
                 self.calib.check(self.spec, len(self.order))
                 self.store.calib = self.calib
             self.enc = Encoder(self.spec, self.calib, len(self.order))
         self.enc.reset()
-        return self.enc
 
-    @staticmethod
-    def _to_host(t):
-        """Start a copy to pinned host memory and return the destination (synchronized later at flush)."""
-        if t.device.type == "cpu":
-            return t
-        dst = torch.empty(t.shape, dtype=t.dtype, device="cpu", pin_memory=True)
-        dst.copy_(t, non_blocking=True)
-        return dst
-
-    def _encode_call(self, seq_ids, starts, acts):
-        enc = self._encoder(acts)
-        streams, err = [], []
-        for i, x in enumerate(acts):
-            st, xhat = enc.encode_layer(i, x, reconstruct=self.fidelity)
-            if self.fidelity:
-                xf = x.float()
-                e = xf - xhat
-                # fp32 and kept on the device as a 0-d tensor: reducing to Python here would synchronize
-                err.append(torch.stack([e.pow(2).sum(), xf.pow(2).sum(), e.abs().max()]))
-            streams.append({k: self._to_host(t) for k, t in st.items()})
-        dev = acts[0].device
-        event = None
-        if dev.type == "cuda":
-            event = torch.cuda.Event()
-            event.record(torch.cuda.current_stream(dev))
-        self._buffer.append((list(seq_ids), list(starts), streams, torch.stack(err) if err else None, event))
-        self._buffered += sum(t.numel() * t.element_size() for st in streams for t in st.values())
+    def _calibrate_layer(self, i, x):
+        v = x.float() if self.spec.is_key(i) else x.float() - self.enc.prev.to(x.device)
+        energy = v.pow(2).sum(tuple(range(v.dim() - 1)))
+        self.calib.outliers[i] = energy.topk(self.spec.outliers).indices.sort().values.cpu()
 
     def _write_buffer(self):
-        """The slow part, off the forward path: wait for the copies, then zstd + write each chunk."""
-        for seq_ids, starts, streams, err, event in self._buffer:
-            if event is not None:
-                event.synchronize()
-            self.store.add_chunk(seq_ids, starts, streams, None if err is None else err.cpu().tolist())
+        """The slow part, off the forward path: move the encoded streams to the host, zstd + write each chunk."""
+        for seq_ids, starts, streams, err in self._buffer:
+            host = [{k: t.cpu() for k, t in st.items()} for st in streams]
+            self.store.add_chunk(seq_ids, starts, host, None if err is None else err.cpu().tolist())
         self._buffer, self._buffered = [], 0

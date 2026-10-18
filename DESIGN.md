@@ -24,10 +24,11 @@ rec.stats()                                 # chunks, sequences, bytes, ratio, p
   positional argument; a one-line extractor for custom models). The attention mask is taken the same way.
 - **Quantize on the device, compress and write off the hot path** (decided 2026-10-18 after a first version
   that staged raw bf16 on the CPU). Quantization is a map-and-reduce over the activations and belongs on the GPU
-  with the forward pass; the hook runs it, starts asynchronous copies of the encoded streams (4-5x smaller than
-  raw) to pinned host memory and returns without synchronizing. zstd and the file writes happen at `flush()`
-  (forced by a host-buffer limit and at close). Budget: under 1% of forward latency; `scripts/sink_overhead.py`
-  measures it. Outlier calibration uses the first call.
+  with the forward pass; each layer's hook runs it as the layer is produced and keeps the encoded streams
+  (2-4x smaller than raw) on the device. zstd and the file writes happen at `flush()`, which first moves the
+  streams to the host (forced by an on-device buffer limit, 1 GiB default, and at close). Budget: under 1% of
+  forward latency; `scripts/sink_overhead.py` measures latency and peak GPU memory. Outlier calibration uses
+  the first call, per layer, in each layer's hook.
 - **File rotation at a size limit**, large (default 4 GB per tensor file): `run1.00000.rsc`, `run1.00001.rsc`, ...
   The index records which file each blob lives in.
 - **Generation is handled on read, not on write.** With the KV cache each step yields `[B, 1, d]`. Every chunk

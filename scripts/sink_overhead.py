@@ -45,24 +45,32 @@ def main():
     sync = torch.cuda.synchronize if dev.type == "cuda" else (lambda: None)
     ids = torch.randint(2, model.config.vocab_size, (a.batch, a.seq_len), device=dev)
     run = lambda: model(ids, use_cache=False)
+    cuda = dev.type == "cuda"
     with torch.no_grad():
         timed(run, 3, sync)                                           # warm-up
+        if cuda:
+            torch.cuda.reset_peak_memory_stats()
         clean = timed(run, a.iters, sync)
+        peak_clean = torch.cuda.max_memory_allocated() if cuda else 0
         res = {}
         for fid in (False, True):
             with tempfile.TemporaryDirectory() as d:
                 sink = rc.Sink(f"{d}/ov", rc.hf_layers(model, a.layers, tok), a.spec, buffer_bytes=1 << 40, fidelity=fid)
                 with sink:
                     timed(run, 3, sync)
+                    if cuda:
+                        torch.cuda.reset_peak_memory_stats()
                     hooked = timed(run, a.iters, sync)
+                    peak = torch.cuda.max_memory_allocated() if cuda else 0
                     t = time.perf_counter()
                     sink.flush()
-                    res[fid] = (statistics.median(hooked), time.perf_counter() - t, sink.stats())
+                    res[fid] = (statistics.median(hooked), time.perf_counter() - t, sink.stats(), peak)
     c = statistics.median(clean)
     print(f"{a.model} layers {a.layers} spec {a.spec} batch {a.batch}x{a.seq_len} on {dev}")
-    print(f"clean forward            {c * 1000:8.1f} ms (median of {a.iters})")
-    for fid, (h, flush, st) in res.items():
-        print(f"with sink, fidelity={str(fid):5s} {h * 1000:8.1f} ms  -> overhead {100 * (h - c) / c:+.2f}%   "
+    print(f"clean forward            {c * 1000:8.1f} ms (median of {a.iters}); peak GPU memory {peak_clean / 2**30:.2f} GiB")
+    for fid, (h, flush, st, peak) in res.items():
+        print(f"with sink, fidelity={str(fid):5s} {h * 1000:8.1f} ms  -> overhead {100 * (h - c) / c:+.2f}%; "
+              f"peak GPU memory {peak / 2**30:.2f} GiB ({(peak - peak_clean) / 2**20:+.0f} MiB); "
               f"flush {flush:.2f} s for {st['chunks']} chunks, {st['bytes_stored'] / 1e6:.1f} MB, ratio {st['ratio']:.2f}x")
 
 
