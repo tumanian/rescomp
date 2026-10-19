@@ -18,7 +18,7 @@ HERE=$(cd "$(dirname "$0")/.." && pwd)
 export AWS_REGION=${AWS_REGION:-us-west-2}
 BOX=${BOX:-main}
 STATE=$HERE/scripts/.box$([ "$BOX" = main ] || echo "-$BOX")
-if [ "$BOX" = main ]; then ID=${BOX_ID:?set BOX_ID to the main box's instance id}; else ID=$(cat "$STATE.id" 2>/dev/null || true); fi
+if [ "$BOX" = main ]; then ID=${BOX_ID:?set BOX_ID to the instance id of the main box}; else ID=$(cat "$STATE.id" 2>/dev/null || true); fi
 KEY=$HOME/.ssh/sae-cpu.pem
 ip() { cat "$STATE.ip"; }
 SSH() { ssh -i "$KEY" -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 ubuntu@"$(ip)" "$@"; }
