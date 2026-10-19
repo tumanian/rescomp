@@ -82,25 +82,40 @@ def _reconstruct(streams, q, spec, O):
     return vhat
 
 
-def _quantize_values(v, q, reconstruct):
-    """The pure tensor work of one layer: scales, codes and (optionally) the dequantized values. Kept free of
-    Python state so it can be torch.compile'd into a few fused kernels."""
+def _layer_values(x, prev, O, sink, q, reconstruct):
+    """The whole tensor work of one layer, free of Python state so torch.compile can fuse it: fp32 cast,
+    closed-loop delta, sink rows and outlier channels out, scales, codes, and (if asked) the reconstruction
+    with the rows and channels restored. Returns (scales, codes, sink_rows, outlier_values, xhat)."""
+    v = x.to(torch.float32, copy=True) if prev is None else x.float() - prev
+    sink_rows = outl = None
+    if sink:
+        sink_rows = v[:, :sink, :].to(torch.bfloat16)
+        v[:, :sink, :] = 0
+    if O is not None:
+        outl = v[..., O].to(torch.bfloat16)
+        v[..., O] = 0
     S = Q.make_scales(v, q)
     codes = Q.quantize(v, S, q)
-    vhat = Q.dequantize(codes, S, q) if reconstruct else None
-    return S, codes, vhat
+    if not reconstruct:
+        return S, codes, sink_rows, outl, None
+    vhat = Q.dequantize(codes, S, q)
+    if O is not None:
+        vhat[..., O] = outl.float()
+    if sink:
+        vhat[:, :sink, :] = sink_rows.float()
+    return S, codes, sink_rows, outl, (vhat if prev is None else prev + vhat)
 
 
 _COMPILED = {}
 
 
-def quantize_values(v, q, reconstruct, compile=False):
+def layer_values(x, prev, O, sink, q, reconstruct, compile=False):
     if not compile:
-        return _quantize_values(v, q, reconstruct)
+        return _layer_values(x, prev, O, sink, q, reconstruct)
     fn = _COMPILED.get("fn")
     if fn is None:
-        fn = _COMPILED["fn"] = torch.compile(_quantize_values, dynamic=True)
-    return fn(v, q, reconstruct)
+        fn = _COMPILED["fn"] = torch.compile(_layer_values, dynamic=True)
+    return fn(x, prev, O, sink, q, reconstruct)
 
 
 class _Walker:
@@ -150,41 +165,28 @@ class Encoder(_Walker):
         """x [B, T, d] -> (streams: name -> tensor on x's device, xhat fp32 [B, T, d]).
         xhat is also the reference for the next delta layer: do not modify it in place.
         reconstruct=False skips the dequantization when no delta layer follows and the caller does not need
-        xhat (returns None); a delta layer always reconstructs."""
+        xhat (returns None); a delta layer always reconstructs. Non-finite inputs are not checked here (a check
+        would synchronize the device); the Writer checks them."""
         if x.dim() != 3:
             raise ValueError(f"expected [B, T, d], got {tuple(x.shape)}")
         self._check(i, x.shape[-1])
         spec = self.spec
-        x = x.float()
-        if not torch.isfinite(x).all():
-            raise ValueError(f"layer {i}: non-finite activations")
         q = spec.quant_for(i)
         Q.check_dim(q, x.shape[-1])
         if spec.sink > x.shape[1]:
             raise ValueError(f"sink{spec.sink} > T={x.shape[1]}")
         key = spec.is_key(i)
-        v = x.clone() if key else x - self.prev.to(x.device)      # layers may live on different GPUs
-        O = self._outl(i, x.device)
-        streams = {}
-        if spec.sink:
-            streams["sink"] = v[:, : spec.sink, :].to(torch.bfloat16)
-            v[:, : spec.sink, :] = 0
-        if O is not None:
-            streams["outliers"] = v[..., O].to(torch.bfloat16)
-            v[..., O] = 0
+        prev = None if key else self.prev.to(x.device)             # layers may live on different GPUs
         needed = reconstruct or (spec.K > 1 and not spec.is_key(i + 1) and i + 1 < self.n_layers)
-        S, codes, vhat = quantize_values(v, q, needed, self.compile)
+        S, codes, sink_rows, outl, xhat = layer_values(x, prev, self._outl(i, x.device), spec.sink, q, needed, self.compile)
+        streams = {}
+        if sink_rows is not None:
+            streams["sink"] = sink_rows
+        if outl is not None:
+            streams["outliers"] = outl
         for j, s in enumerate(S):
             streams[f"scale{j}"] = s
         streams["codes"] = codes
-        if not needed:
-            self.prev = None
-            return streams, None
-        if O is not None:
-            vhat[..., O] = streams["outliers"].float()
-        if spec.sink:
-            vhat[:, : spec.sink, :] = streams["sink"].float()
-        xhat = vhat if key else self.prev.to(x.device) + vhat
         self.prev = xhat
         return streams, xhat
 

@@ -116,8 +116,6 @@ def test_calib_ids_validated(acts):
     enc.encode_layer(0, acts[0])
     with pytest.raises(ValueError, match="d changed"):
         enc.encode_layer(1, acts[1][..., :32])
-    with pytest.raises(ValueError, match="non-finite"):
-        Encoder("bf16", None, 1).encode_layer(0, acts[0] * float("inf"))
 
 
 def test_calib_check():
