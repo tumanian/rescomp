@@ -67,6 +67,10 @@ def layer_values(x, prev, O, sink, q, reconstruct, compile=False):
         return _layer_values(x, prev, O, sink, q, reconstruct)
     fn = _COMPILED.get("fn")
     if fn is None:
+        # Inductor keeps the intermediates of a fused kernel in fp32 by default, which would skip the fp16 rounding
+        # of the scales and codes on the way to xhat; the emulation keeps the compiled bytes equal to the eager ones.
+        import torch._inductor.config as inductor_config
+        inductor_config.emulate_precision_casts = True
         fn = _COMPILED["fn"] = torch.compile(_layer_values, dynamic=True)
     return fn(x, prev, O, sink, q, reconstruct)
 
