@@ -107,15 +107,28 @@ class Sink:
     def __exit__(self, *exc):
         self.close()
 
-    # -- per hooked layer, inside the model's forward
+    # -- the hook side. Two extension points: `_layer_step` (one layer's activation -> what the call keeps) and
+    # `_call_step` (a complete call -> what goes into the buffer). `_on_layer` / `_complete_call` are the fixed
+    # entry points the hooks call; they keep the call record and the sequence bookkeeping.
     def _on_layer(self, l, x, call):
-        """Encode this layer now, on its device, so the model can free the activation as usual."""
+        """Hook entry, inside the model's forward: the first stored layer opens the call record; a layer that
+        fires without the first one, or with a different shape, is dropped (the call ends up incomplete)."""
         i = self.order.index(l)
         if i == 0:
-            call["shape"], call["streams"], call["err"] = tuple(x.shape), {}, {}
-            self._encoder_for(x)
+            call["shape"], call["n_done"] = tuple(x.shape), 0
         if "shape" not in call or tuple(x.shape) != call["shape"]:
-            return                                     # a layer fired without the first one (or shapes changed): drop the call
+            return
+        self._layer_step(i, l, x, call)
+        call["n_done"] += 1
+
+    def _layer_step(self, i, l, x, call):
+        """Extension point 1, per stored layer (i: index in storage order, l: layer number, x: the activation
+        [B, T, d] on its device). Turns the activation into what the call record keeps for `_call_step`. Runs
+        inside the forward, so it must be cheap and must not synchronize. The Sink encodes the layer now, on its
+        device, so the model can free the activation as usual."""
+        if i == 0:
+            call["streams"], call["err"] = {}, {}
+            self._encoder_for(x)
         if self._choosing:
             self._choose_channels(i, x)
         st, xhat = self.enc.encode_layer(i, x, reconstruct=self.fidelity)
@@ -128,9 +141,11 @@ class Sink:
         if l == self.order[-1] and self._choosing:
             self._choosing = False
 
-    # -- a complete forward call
     def _complete_call(self, call):
-        if len(call.get("streams", {})) != len(self.order):
+        """The last stored layer fired: a call every layer went through becomes a chunk; one with a dropped layer
+        counts as incomplete. Decides whether the call continues the B open sequences (a generation step: T == 1
+        with the model's cache signal, or lacking that, after a call of the same batch size) or starts new ones."""
+        if call.get("n_done") != len(self.order):
             self.hooks.n_incomplete += 1
             self.hooks.n_calls -= 1
             return
@@ -138,7 +153,27 @@ class Sink:
         cont = call["cont"]
         if cont is None:
             cont = T == 1 and len(self._open) == B
-        if cont and len(self._open) == B:
+        self._call_step(call, cont and len(self._open) == B)
+
+    def _call_step(self, call, cont):
+        """Extension point 2, per complete call: register its sequences (`_register`) and put what `_layer_step`
+        kept into the buffer; `cont` says the call continues the open sequences rather than starting B new ones.
+        The Sink buffers one encoded chunk per call and flushes when the on-device buffer is full."""
+        seq_ids, starts = self._register(call, cont)
+        B, T, d = call["shape"]
+        self.store.note_raw(B * T * d * 2 * len(self.order), d)
+        streams = [call["streams"][l] for l in self.order]
+        err = torch.stack([call["err"][l] for l in self.order]) if self.fidelity else None
+        self._buffer.append((seq_ids, starts, streams, err))
+        self._buffered += sum(t.numel() * t.element_size() for st in streams for t in st.values())
+        if self._buffered >= self.buffer_bytes:
+            self.flush()
+
+    def _register(self, call, cont):
+        """The call's sequences in the store: the B open ones extended by its T tokens, or B new ones with the
+        pending annotations. Returns (seq_ids, start positions)."""
+        B, T, d = call["shape"]
+        if cont:
             seq_ids = list(self._open)
             starts = [self._len[s] for s in seq_ids]
             if call["ids"] is not None:
@@ -157,13 +192,7 @@ class Sink:
             self._open = seq_ids
         for s in seq_ids:
             self._len[s] = self._len.get(s, 0) + T
-        self.store.note_raw(B * T * d * 2 * len(self.order), d)
-        streams = [call["streams"][l] for l in self.order]
-        err = torch.stack([call["err"][l] for l in self.order]) if self.fidelity else None
-        self._buffer.append((list(seq_ids), list(starts), streams, err))
-        self._buffered += sum(t.numel() * t.element_size() for st in streams for t in st.values())
-        if self._buffered >= self.buffer_bytes:
-            self.flush()
+        return seq_ids, starts
 
     def _take_annotations(self, B):
         out = {}
