@@ -4,8 +4,7 @@
     python scripts/run_models.py --model gpt2 --layers 8 9 10 11 --n-seq 128 --seq-len 256 --batch 16 \
         --specs exact faithful balanced compact --coherence-specs compact --out results/gpt2
 
-Specs may be regime names, templates with {G}/{O}/{G8}/{O2}, "uabs@0.1" (step = 0.1 x the rms of the non-outlier
-channels of the calibration sample) or plain spec strings. Keeps one JSON line per spec in <out>/results.jsonl
+Specs may be regime names, templates with {G}/{O}/{G8}/{O2} or plain spec strings. Keeps one JSON line per spec in <out>/results.jsonl
 (specs already there are skipped, or extended when a new measurement is requested)."""
 import argparse
 import json
@@ -14,7 +13,6 @@ import sys
 import time
 from pathlib import Path
 
-import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -24,7 +22,7 @@ from rescomp.cli import PROMPTS                        # noqa: E402
 from rescomp.data import wikitext_sequences            # noqa: E402
 from rescomp.hf import hf_layers, load_model           # noqa: E402
 
-DEFAULT_SPECS = ["exact", "faithful", "balanced", "compact", "fp8_e4m3+out8", "uabs@0.1+out8", "nvfp4+layerK4+out8",
+DEFAULT_SPECS = ["exact", "faithful", "balanced", "compact", "fp8_e4m3+out8", "nvfp4+layerK4+out8",
                  "mxfp4+layerK4+out8", "int4_g64+layerK4+out8", "int4_g{G}+layerK4+out{O}", "int4_g{G8}+out{O2}"]
 
 
@@ -32,11 +30,7 @@ def show(x, fmt=".4f"):
     return "-" if x is None else format(x, fmt)
 
 
-def resolve_name(name, d, rms):
-    if name.startswith("uabs@"):
-        head, *rest = name.split("+")
-        step = np.format_float_positional(float(head[5:]) * rms, precision=4, trim="-", fractional=False)
-        name = "+".join([f"uabs{step}"] + rest)
+def resolve_name(name, d):
     return rc.resolve_spec(name, d).name
 
 
@@ -88,18 +82,12 @@ def main():
         print(f"captured {base} in {time.time() - t0:.0f}s", flush=True)
     with rc.open(base) as r:
         d = r.d
-        n_cal = min(32, r.n_seq)
-        sample = torch.stack([torch.stack(r.read(l, slice(0, n_cal))) for l in r.layers])
-        cal = rc.choose_channels(sample, f"bf16+out{max(8, d // 64)}")
-        keep = torch.ones(d, dtype=torch.bool)
-        keep[cal.ids.flatten().unique()] = False
-        rms = float(sample[..., keep].pow(2).mean().sqrt())
         ident = I.kl_ppl(run, tokens[:8], I.Patcher(L, lambda l, x, s, st: x), batch=a.batch)
     assert ident["kl_mean"] == 0.0, ident
-    print(f"base: identity KL {ident['kl_mean']}, rms (no outliers) {rms:.3g}", flush=True)
+    print(f"base: identity KL {ident['kl_mean']}", flush=True)
     n_kl = min(a.kl_seqs or a.n_seq, a.n_seq)
     for raw in a.specs:
-        spec = resolve_name(raw, d, rms)
+        spec = resolve_name(raw, d)
         want_per = raw in a.per_layer_specs or spec in a.per_layer_specs
         want_coh = raw in a.coherence_specs or spec in a.coherence_specs
         stem = str(out / spec.replace("+", "_").replace("=", "-"))

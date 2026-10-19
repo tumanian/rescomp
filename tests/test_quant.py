@@ -2,12 +2,14 @@ import pytest
 import torch
 
 from rescomp import quant as Q
+from rescomp.quant import quantizer
 
 
-def roundtrip(v, q):
-    S = Q.make_scales(v, q)
-    c = Q.quantize(v, S, q)
-    return Q.dequantize(c, S, q), c, S
+def roundtrip(v, name):
+    q = quantizer(name)
+    S = q.scales(v)
+    c = q.encode(v, S)
+    return q.decode(c, S), c, S
 
 
 @pytest.fixture
@@ -18,9 +20,19 @@ def v():
     return x
 
 
+def test_factory():
+    assert type(quantizer("int4_g512")).__name__ == "GroupInt" and quantizer("int4_g512").group == 512
+    assert quantizer("int4_g512") is quantizer("int4_g512")
+    assert type(quantizer("int8_tok")).__name__ == "PerTokenInt8" and quantizer("int8_tok").group is None
+    assert type(quantizer("fp16")).__name__ == "Cast" and type(quantizer("nvfp4")).__name__ == "NVFP4"
+    for bad in ("int5_g8", "int2_g16", "uabs0.1", "int4_g0", "int4", "fp64", 12):
+        with pytest.raises(ValueError):
+            quantizer(bad)
+
+
 def test_fp32_exact(v):
     y, c, S = roundtrip(v, "fp32")
-    assert torch.equal(y, v) and S == [] and c.dtype == torch.float32
+    assert torch.equal(y, v) and S == [] and c.dtype == torch.float32 and y is not c
 
 
 def test_bf16_fp16_relative_error(v):
@@ -39,8 +51,8 @@ def test_fp16_clamps_instead_of_overflowing():
 
 def test_int8_tok_bound(v):
     y, c, S = roundtrip(v, "int8_tok")
-    assert c.dtype == torch.int8 and S[0].shape == (3, 7, 1)
-    assert ((y - v).abs() <= S[0].float() / 2 + 1e-5).all()
+    assert c.dtype == torch.int8 and S[0].shape == (3, 7, 1) and S[0].dtype == torch.float16
+    assert ((y - v).abs() <= S[0].float() / 2 + 1e-3 * S[0].float()).all()        # torchao: no clipping
 
 
 def test_fp8_bound(v):
@@ -50,18 +62,17 @@ def test_fp8_bound(v):
     assert ((y - v).abs() <= v.abs() * 2 ** -4 + S[0].float() * 2 ** -6 + 1e-5).all()
 
 
-@pytest.mark.parametrize("q,bits", [("int8_g64", 8), ("int4_g16", 4), ("int4_g64", 4)])
-def test_int_group_bound_and_packing(v, q, bits):
-    y, c, S = roundtrip(v, q)
-    G = Q.qinfo(q)["group"]
+@pytest.mark.parametrize("name,bits", [("int8_g64", 8), ("int4_g16", 4), ("int4_g64", 4)])
+def test_int_group_bound_and_packing(v, name, bits):
+    y, c, S = roundtrip(v, name)
+    G = quantizer(name).group
     assert S[0].shape == (3, 7, 64 // G) and S[0].dtype == torch.float16
-    assert c.shape == (3, 7, 64 * bits // 8)
+    assert c.shape == (3, 7, 64 * bits // 8) and c.dtype == (torch.int8 if bits == 8 else torch.uint8)
     step = S[0].float().repeat_interleave(G, -1)
     assert ((y - v).abs() <= step / 2 + 1e-3 * step).all()          # no clipping: every value within half a step
-    assert c.dtype == (torch.int8 if bits == 8 else torch.uint8)
     # the grid is torchao's: scale = max(-min / qmin, max / qmax) per group, then fp16
     g = v.unflatten(-1, (-1, G))
-    qmin, qmax = Q.qinfo(q)["qmin"], Q.qinfo(q)["qmax"]
+    qmin, qmax = quantizer(name).qrange
     expect = torch.maximum(g.amin(-1) / qmin, g.amax(-1) / qmax).clamp(min=torch.finfo(torch.float32).eps).half()
     assert torch.equal(S[0], expect)
 
@@ -72,37 +83,20 @@ def test_pack_unpack():
     assert torch.equal(mxk.unpack_uint4(mxk.pack_uint4(q)), q)
 
 
-@pytest.mark.parametrize("step", [0.05, 0.5, 2.0])
-def test_uabs_bound_and_planes(v, step):
-    q = f"uabs{step}"
-    y, c, S = roundtrip(v, q)
-    assert S == [] and c.shape == (4, 3, 7, 64) and c.dtype == torch.uint8
-    assert ((y - v).abs() <= step / 2 + 1e-5).all()
-    # ordinary values use only the low plane(s): the top plane is all zero, and so is plane 2 outside the outlier channel
-    assert int(c[3].sum()) == 0 and int(c[2][..., [i for i in range(64) if i != 9]].sum()) == 0
-
-
-def test_uabs_negative_values_zigzag():
-    v = torch.tensor([[0.0, -0.1, 0.1, -0.2, 0.2, -1000.0]])
-    y, c, _ = roundtrip(v, "uabs0.1")
-    assert torch.allclose(y, v, atol=0.05)
-
-
-@pytest.mark.parametrize("q", ["mxfp4", "nvfp4"])
-def test_fp4_bound(v, q):
-    y, c, S = roundtrip(v, q)
+@pytest.mark.parametrize("name", ["mxfp4", "nvfp4"])
+def test_fp4_bound(v, name):
+    y, c, S = roundtrip(v, name)
     assert c.shape == (3, 7, 32) and c.dtype == torch.uint8
-    s = (S[1].float() * S[0]).repeat_interleave(16, -1) if q == "nvfp4" else S[0].float().repeat_interleave(32, -1)
+    s = (S[1].float() * S[0]).repeat_interleave(16, -1) if name == "nvfp4" else S[0].float().repeat_interleave(32, -1)
     # e2m1 grid spacing is at most 2 (between 4 and 6) in scaled units, so error <= 1 scale unit; mxfp4's power-of-two
     # scale puts the group max anywhere in [4, 8), so values above 6 clip (error up to 2 units); nvfp4's e4m3 block
     # scale rounds, so allow its 1/16 relative step on top
-    assert ((y - v).abs() <= s * (2.0 if q == "mxfp4" else 1.0 + 1 / 8) + 1e-4).all()
+    assert ((y - v).abs() <= s * (2.0 if name == "mxfp4" else 1.0 + 1 / 8) + 1e-4).all()
     assert ((y.abs()) <= s * 6 + 1e-4).all()
-    assert S[0].dtype == (torch.float8_e8m0fnu if q == "mxfp4" else torch.float32)
+    assert S[0].dtype == (torch.float8_e8m0fnu if name == "mxfp4" else torch.float32)
 
 
 def test_fp4_matches_torchao_reference(v):
-    """mxfp4 decodes with torchao's own to_dtype; nvfp4 with its f4 table and scales."""
     from torchao.prototype.mx_formats import mx_tensor
     y, c, S = roundtrip(v, "mxfp4")
     assert torch.equal(y, mx_tensor.to_dtype(c, S[0], Q.MX_ELEM, 32, torch.float32))
@@ -111,28 +105,19 @@ def test_fp4_matches_torchao_reference(v):
 
 
 def test_check_dim():
-    Q.check_dim("int4_g16", 64)
-    Q.check_dim("bf16", 7)
+    quantizer("int4_g16").check_dim(64)
+    quantizer("bf16").check_dim(7)
+    quantizer("int8_tok").check_dim(7)
     with pytest.raises(ValueError):
-        Q.check_dim("int4_g48", 64)
+        quantizer("int4_g48").check_dim(64)
     with pytest.raises(ValueError):
-        Q.check_dim("mxfp4", 48)
+        quantizer("mxfp4").check_dim(48)
     with pytest.raises(ValueError):
-        Q.check_dim("int4_g0", 64)
-    with pytest.raises(ValueError):
-        Q.check_dim("int4_g3", 9)        # 2 codes per byte: d must be even
-
-
-
-
-def test_qinfo_rejects_unknown():
-    with pytest.raises(ValueError):
-        Q.qinfo("int5_g8")
-
+        quantizer("int4_g3").check_dim(9)        # 2 codes per byte: d must be even
 
 
 def test_zero_group_is_exact_zero():
     v = torch.zeros(2, 3, 32)
-    for q in ["int4_g16", "int8_tok", "fp8_e4m3", "mxfp4", "nvfp4", "uabs0.1"]:
-        y, _, _ = roundtrip(v, q)
-        assert torch.equal(y, v), q
+    for name in ["int4_g16", "int8_tok", "fp8_e4m3", "mxfp4", "nvfp4"]:
+        y, _, _ = roundtrip(v, name)
+        assert torch.equal(y, v), name

@@ -26,6 +26,7 @@ import pyarrow.parquet as pq
 import torch
 
 from . import lossless as LL
+from .lossless import lossless
 from ._version import __version__
 from .bf16_wrapper import OutlierChannels, check_channels, choose_channels
 from .codec import Decoder, Encoder
@@ -58,8 +59,8 @@ class BlobFiles:
     On a remote filesystem flush() closes the current file (an object is only readable once complete) and the
     next append starts a new one."""
 
-    def __init__(self, loc, rotate_bytes=None, level=3, shuffle=True):
-        self.loc, self.level, self.shuffle = loc, level, shuffle
+    def __init__(self, loc, rotate_bytes=None, codec=None):
+        self.loc, self.codec = loc, codec or lossless()
         self.rotate_bytes = int(rotate_bytes or loc.rotate_default)
         self.n = -1
         self.f = None
@@ -76,7 +77,7 @@ class BlobFiles:
 
     def append(self, t):
         t = t.detach() if isinstance(t, torch.Tensor) else torch.as_tensor(np.asarray(t))
-        comp, raw = LL.compress(t, self.level, self.shuffle)
+        comp, raw = self.codec.compress(t)
         if self.f is None or (self.pos > HEAD2 and self.pos + len(comp) > self.rotate_bytes):
             self._open_new()
         self.f.write(comp)
@@ -135,7 +136,8 @@ class Store:
                  hook_names=None, extra=None, rotate_bytes=None, bucket=None, prefix=None, s3=None):
         """stem: a local path stem, an s3://bucket/prefix/name URI, or a name with bucket= and prefix=.
         spec may be None at construction (a regime that needs the model width) and set with set_spec()
-        before the first chunk. rotate_bytes defaults to 4 GiB locally and 1 GiB on S3."""
+        before the first chunk. level/shuffle configure the zstd lossless stage (rescomp.lossless);
+        rotate_bytes defaults to 4 GiB locally and 1 GiB on S3."""
         self.loc = location(stem, bucket, prefix, s3)
         self.stem = self.loc.uri
         self.spec = None if spec is None else Spec.parse(spec)
@@ -146,13 +148,14 @@ class Store:
         self.chunk_rows, self.blob_rows = [], []
         if self.spec is not None:
             self.set_spec(self.spec)
-        self.model, self.site, self.level, self.shuffle = dict(model), site, level, shuffle
+        self.model, self.site = dict(model), site
+        self.codec = lossless(level=level, shuffle=shuffle)
         self.hook_names = {str(k): v for k, v in (hook_names or {}).items()}
         self.extra = dict(extra or {})
         self.regime = None               # the regime name this spec came from, if any
         json.dumps({"model": self.model, "hook_names": self.hook_names, "extra": self.extra})
         self.loc.ensure_dir()
-        self.blobs = BlobFiles(self.loc, rotate_bytes, level, shuffle)
+        self.blobs = BlobFiles(self.loc, rotate_bytes, self.codec)
         self.seq = {}                    # seq_id -> {"tokens": list[int] | None, "mask": list[int] | None, "ann": {}}
         self.d = None
         L = len(self.layers)
@@ -239,7 +242,7 @@ class Store:
                 "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "model": json.dumps(self.model),
                 "spec": self.spec.name if self.spec else None, "regime": self.regime,
                 "outlier_channels": json.dumps((self.channels or OutlierChannels(None, "none")).to_dict()),
-                "lossless": json.dumps({"codec": "zstd", "level": self.level, "shuffle": self.shuffle}),
+                "lossless": json.dumps(self.codec.to_dict()),
                 "site": self.site, "d_model": self.d, "layers": json.dumps(layers),
                 "fidelity": json.dumps({"rel_l2": float(np.sqrt(self.sse.sum() / total)) if total > 0 else None,
                                         "max_abs": float(self.maxabs.max()) if self.n_measured else None,
@@ -331,7 +334,7 @@ class Reader:
         self.channels = OutlierChannels.from_dict(self.header["outlier_channels"])
         self.layers = [l["layer"] for l in self.header["layers"]]
         self.d = m["d_model"]
-        self.shuffle = self.header["lossless"]["shuffle"]
+        self.codec = lossless(self.header["lossless"])
         self.chunks = pq.read_table(table_path(self.loc, "chunks"), filesystem=fs).to_pylist()
         self.blobs = defaultdict(dict)                   # (chunk, layer) -> stream -> record
         for r in pq.read_table(table_path(self.loc, "blobs"), filesystem=fs).to_pylist():
@@ -377,7 +380,7 @@ class Reader:
             raise ValueError("truncated blob file")
         if self.verify and zlib.crc32(b) != rec["crc32"]:
             raise ValueError(f"crc mismatch in file {rec['file']} at offset {rec['offset']}")
-        return LL.decompress(b, rec["dtype"], rec["shape"], rec["raw_nbytes"], self.shuffle)
+        return self.codec.decompress(b, rec["dtype"], rec["shape"], rec["raw_nbytes"])
 
     def streams(self, chunk, layer):
         return {k: self._read_blob(r) for k, r in self.blobs[(chunk, layer)].items()}
@@ -461,7 +464,7 @@ class Reader:
                  f"model: {m.get('id')} rev {m.get('revision')} n_layers={m.get('n_layers')} d_model={m.get('d_model')}",
                  f"stored: {h['n_sequences']} sequences, {h['n_tokens']} tokens, {h['n_chunks']} chunks in {h['n_files']} "
                  f"blob file(s); layers {self.layers}; site {h['site']}",
-                 f"spec: {h['spec']}{' (regime ' + h['regime'] + ')' if h.get('regime') else ''}   lossless: zstd-{h['lossless']['level']}{' + byte shuffle' if self.shuffle else ''}",
+                 f"spec: {h['spec']}{' (regime ' + h['regime'] + ')' if h.get('regime') else ''}   lossless: {h['lossless']}",
                  f"bytes: {b['activations_stored']:,} stored / {b['activations_raw_bf16']:,} raw bf16 = {ratio}",
                  ("fidelity: not measured (Sink(fidelity=True) measures it)" if h["fidelity"]["rel_l2"] is None else
                   f"fidelity: rel L2 {h['fidelity']['rel_l2']:.3e}, max abs err {h['fidelity']['max_abs']:.3g}")]

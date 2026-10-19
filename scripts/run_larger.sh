@@ -6,9 +6,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 PY=${PY:-$HOME/venv/bin/python}
-SPECS='bf16 fp16 int8_tok+out8 uabs@0.1+out8 compact balanced int4_g{G}+layerK4+out{O} nvfp4+layerK4+out8 int2_g16+layerK4+out16'
-COH='compact balanced uabs@0.1+out8'
-PER='compact balanced uabs@0.1+out8 int8_tok+out8'
+SPECS='bf16 fp16 int8_tok+out8 compact balanced int4_g{G}+layerK4+out{O} nvfp4+layerK4+out8 int2_g16+layerK4+out16'
+COH='compact balanced'
+PER='compact balanced int8_tok+out8'
 run() { $PY scripts/run_models.py "$@" --specs $SPECS --coherence-specs $COH --per-layer-specs $PER; }
 case ${1:-a10g} in
   a10g)

@@ -2,26 +2,23 @@
 
     <quant>[+layerK<K>][+out<n>][+sink<s>][+key=<quant>]
 
-quant     fp32 | bf16 | fp16 | fp8_e4m3 | int8_tok | int{4,8}_g<G> | uabs<step> | mxfp4 | nvfp4
+quant     fp32 | bf16 | fp16 | fp8_e4m3 | int8_tok | int{4,8}_g<G> | mxfp4 | nvfp4   (see quant.py)
 layerK    closed-loop layer delta: stored layer i is coded as x_i - xhat_{i-1} unless i % K == 0 (a keyframe)
 out       the n highest-energy channels of each stored layer are kept in bf16 (chosen by calibration)
 sink      the first s tokens of every sequence are kept in bf16 (attention-sink / BOS rows)
 key       hybrid: a different quantizer for keyframe layers (e.g. key=bf16 keeps keyframes exact)
 
-Examples: "fp16", "bf16", "int4_g384+layerK4+out12", "int4_g512+layerK4+out32+key=bf16", "uabs0.1+out8".
+Examples: "fp16", "bf16", "int4_g384+layerK4+out12", "int4_g512+layerK4+out32+key=bf16".
 """
 import re
 from dataclasses import dataclass, asdict
 from typing import Optional
 
-QUANT_RE = re.compile(r"^(fp32|bf16|fp16|fp8_e4m3|int8_tok|int[48]_g[1-9]\d*|uabs\d*\.?\d+|mxfp4|nvfp4)$")
 
 
 def check_quant(q):
-    if not isinstance(q, str) or not QUANT_RE.match(q):
-        raise ValueError(f"unknown quantizer {q!r}")
-    if q.startswith("uabs") and float(q[4:]) <= 0:
-        raise ValueError("uabs step must be > 0")
+    from .quant import quantizer
+    quantizer(q)                      # raises for unknown names
     return q
 
 

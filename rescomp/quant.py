@@ -1,62 +1,66 @@
-"""Quantizers. v is an fp32 tensor [..., d]; the last dim is the channel dim.
+"""Quantizers: one class per format, all built by `quantizer(name)`.
 
-Each quantizer is three functions: make_scales(v) -> list of scale tensors, quantize(v, scales) -> codes,
-dequantize(codes, scales) -> fp32. Codes and scales are plain tensors whose dtype and shape are stored with them.
-dequantize(quantize(v)) is the same on the encoder and the decoder (codec version 2).
+A quantizer turns one fp32 tensor v [..., d] (the channel dim last) into codes plus scales and back:
+    scales(v) -> list of scale tensors      encode(v, scales) -> codes      decode(codes, scales) -> fp32
+Codes and scales are plain tensors stored with their dtype and shape. decode(encode(v)) is the same on the
+encoder and the decoder, and the on-disk bytes are pinned to the library that does the arithmetic (codec version 3):
 
-Block formats come from torchao and the on-disk format is pinned to its numerics:
-  int{4,8}_g<G>        torchao affine quantization, MappingType.SYMMETRIC_NO_CLIPPING_ERR over the full range
-                       [-2^(b-1), 2^(b-1)-1] with one fp16 scale per group of G channels (the scale is the larger
-                       of -min/qmin and max/qmax, so nothing clips and the extra negative level is used when it
-                       helps); 4-bit codes packed with torchao's pack_uint4, int8 stored as is
-  mxfp4                OCP MX: e2m1 codes, one e8m0 scale per 32 channels (torchao to_mx / to_dtype)
-  nvfp4                NVIDIA FP4: e2m1 codes, one e4m3 scale per 16 channels and one fp32 per-tensor scale
-                       (torchao nvfp4_quantize; dequantized with its f4 table)
-Torch-native:
-  fp32 / bf16 / fp16   plain casts (fp16 clamps to +-65504 first)
-  fp8_e4m3             per-token fp16 scale, e4m3 codes
-  int8_tok             per-token fp16 scale, int8 codes in [-127, 127]
-  uabs<step>           fixed step in activation units: round(v / step), zigzag-coded, stored as 4 byte planes
-                       (entropy coder friendly: the high planes are almost all zero); |v| must be < 2^30 steps
+| name           | class        | arithmetic                                                              |
+|----------------|--------------|-------------------------------------------------------------------------|
+| fp32/bf16/fp16 | Cast         | torch casts (fp16 clamps to +-65504)                                     |
+| fp8_e4m3       | PerTokenFp8  | torch float8_e4m3fn cast, one fp16 scale per token                       |
+| int8_tok       | PerTokenInt8 | torchao affine, symmetric no-clipping, [-128, 127], one fp16 scale/token |
+| int{4,8}_g<G>  | GroupInt     | torchao affine, symmetric no-clipping, full range, fp16 scale per group  |
+| mxfp4          | MXFP4        | torchao to_mx / to_dtype: e2m1 codes, e8m0 scale per 32 channels         |
+| nvfp4          | NVFP4        | torchao nvfp4_quantize: e2m1 codes, e4m3 scale per 16, fp32 tensor scale |
 """
 import re
+from abc import ABC, abstractmethod
 
 import torch
 from torchao.prototype.mx_formats import kernels as mxk
 from torchao.prototype.mx_formats import mx_tensor, nvfp4_tensor
 from torchao.quantization import quant_primitives as qp
 
-CODEC_VERSION = 2
+CODEC_VERSION = 3
 FP16_TINY = 2.0 ** -14
 FP16_MAX = 65504.0
 MX_ELEM = torch.float4_e2m1fn_x2
 
 
-def qinfo(q):
-    if q in ("fp32", "bf16", "fp16", "fp8_e4m3", "int8_tok"):
-        return {"kind": q}
-    if q == "nvfp4":
-        return {"kind": "nvfp4", "bits": 4, "group": 16}
-    if q == "mxfp4":
-        return {"kind": "mxfp4", "bits": 4, "group": 32}
-    if q.startswith("uabs"):
-        return {"kind": "uabs", "step": float(q[4:])}
-    m = re.fullmatch(r"int([48])_g(\d+)", q)
-    if not m:
-        raise ValueError(f"unknown quantizer {q!r}")
-    b = int(m[1])
-    return {"kind": "int", "bits": b, "group": int(m[2]), "qmin": -(2 ** (b - 1)), "qmax": 2 ** (b - 1) - 1}
+class Quantizer(ABC):
+    pattern: "re.Pattern"          # matches the names this class builds
+    group = None                   # channels per scale (None: per token or none)
+    codes_per_byte = 1
 
+    def __init__(self, name):
+        self.name = name
 
-def check_dim(q, d):
-    """Raise if quantizer q cannot code a channel dim of d."""
-    i = qinfo(q)
-    g = i.get("group")
-    if g is not None and (g <= 0 or d % g != 0):
-        raise ValueError(f"{q}: group size {g} must divide d={d}")
-    per = 2 if i.get("bits") == 4 else 1
-    if d % per != 0:
-        raise ValueError(f"{q}: {i['bits']}-bit codes pack {per} per byte, so d={d} must be a multiple of {per}")
+    @classmethod
+    def matches(cls, name):
+        return cls.pattern.fullmatch(name) is not None
+
+    def check_dim(self, d):
+        """Raise if this quantizer cannot block a channel dim of d."""
+        if self.group is not None and (self.group <= 0 or d % self.group != 0):
+            raise ValueError(f"{self.name}: group size {self.group} must divide d={d}")
+        if d % self.codes_per_byte != 0:
+            raise ValueError(f"{self.name}: {self.codes_per_byte} codes per byte, so d={d} must be a multiple of it")
+
+    @abstractmethod
+    def scales(self, v):
+        ...
+
+    @abstractmethod
+    def encode(self, v, S):
+        ...
+
+    @abstractmethod
+    def decode(self, codes, S):
+        ...
+
+    def __repr__(self):
+        return f"{type(self).__name__}({self.name!r})"
 
 
 def _half_scale(amax, qmax):
@@ -67,96 +71,125 @@ def _block(v, G):
     return (1,) * (v.dim() - 1) + (G,)
 
 
-# ---------------------------------------------------------------- scales
+class Cast(Quantizer):
+    pattern = re.compile(r"fp32|bf16|fp16")
 
-def make_scales(v, q):
-    i = qinfo(q)
-    k = i["kind"]
-    if k in ("fp32", "bf16", "fp16", "uabs"):
+    def scales(self, v):
         return []
-    a = v.abs()
-    if k == "int8_tok":
-        return [_half_scale(a.amax(-1, keepdim=True), 127)]
-    if k == "fp8_e4m3":
-        return [_half_scale(a.amax(-1, keepdim=True), 448)]
-    if k == "int":
-        s, _ = qp.choose_qparams_affine(v, qp.MappingType.SYMMETRIC_NO_CLIPPING_ERR, _block(v, i["group"]), torch.int8,
-                                        quant_min=i["qmin"], quant_max=i["qmax"], scale_dtype=torch.float16)
-        return [s.reshape(*v.shape[:-1], -1)]                      # always [..., d / G], even when G == d
-    if k == "nvfp4":
-        gscale = nvfp4_tensor.per_tensor_amax_to_scale(a.amax()).reshape(1).float().clamp(min=1e-30)   # keeps torchao's reciprocal finite for an all-zero input
+
+    def encode(self, v, S):
+        if self.name == "fp32":
+            return v.float().clone()
+        if self.name == "bf16":
+            return v.to(torch.bfloat16)
+        return v.clamp(-FP16_MAX, FP16_MAX).to(torch.float16)
+
+    def decode(self, codes, S):
+        return codes.clone() if self.name == "fp32" else codes.float()      # never alias the codes stream
+
+
+class PerTokenFp8(Quantizer):
+    pattern = re.compile(r"fp8_e4m3")
+
+    def scales(self, v):
+        return [_half_scale(v.abs().amax(-1, keepdim=True), 448)]
+
+    def encode(self, v, S):
+        return (v / S[0].float()).clamp(-448, 448).to(torch.float8_e4m3fn)
+
+    def decode(self, codes, S):
+        return codes.float() * S[0].float()
+
+
+class _Affine(Quantizer):
+    """torchao affine quantization, symmetric without clipping over the full signed range, fp16 scales."""
+    bits = 8
+
+    @property
+    def qrange(self):
+        return -(2 ** (self.bits - 1)), 2 ** (self.bits - 1) - 1
+
+    def _block(self, v):
+        return _block(v, self.group or v.shape[-1])
+
+    def scales(self, v):
+        qmin, qmax = self.qrange
+        s, _ = qp.choose_qparams_affine(v, qp.MappingType.SYMMETRIC_NO_CLIPPING_ERR, self._block(v), torch.int8,
+                                        quant_min=qmin, quant_max=qmax, scale_dtype=torch.float16)
+        return [s.reshape(*v.shape[:-1], -1)]                     # always [..., d / G]
+
+    def encode(self, v, S):
+        qmin, qmax = self.qrange
+        zp = torch.zeros_like(S[0], dtype=torch.int32)
+        c = qp.quantize_affine(v, self._block(v), S[0], zp, torch.int8, qmin, qmax)
+        return c if self.bits == 8 else mxk.pack_uint4((c.to(torch.int16) - qmin).to(torch.uint8))
+
+    def decode(self, codes, S):
+        qmin, qmax = self.qrange
+        c = codes if self.bits == 8 else (mxk.unpack_uint4(codes).to(torch.int16) + qmin).to(torch.int8)
+        zp = torch.zeros_like(S[0], dtype=torch.int32)
+        return qp.dequantize_affine(c, self._block(c), S[0], zp, torch.int8, qmin, qmax, output_dtype=torch.float32)
+
+
+class PerTokenInt8(_Affine):
+    pattern = re.compile(r"int8_tok")
+
+
+class GroupInt(_Affine):
+    pattern = re.compile(r"int([48])_g([1-9]\d*)")
+
+    def __init__(self, name):
+        super().__init__(name)
+        m = self.pattern.fullmatch(name)
+        self.bits, self.group = int(m[1]), int(m[2])
+        self.codes_per_byte = 8 // self.bits
+
+
+class MXFP4(Quantizer):
+    pattern = re.compile(r"mxfp4")
+    group, codes_per_byte = 32, 2
+
+    def scales(self, v):
+        return [mx_tensor.to_mx(v, MX_ELEM, 32)[0]]
+
+    def encode(self, v, S):
+        return mx_tensor.to_mx(v, MX_ELEM, 32)[1]
+
+    def decode(self, codes, S):
+        return mx_tensor.to_dtype(codes, S[0], MX_ELEM, 32, torch.float32)
+
+
+class NVFP4(Quantizer):
+    pattern = re.compile(r"nvfp4")
+    group, codes_per_byte = 16, 2
+
+    def scales(self, v):
+        # per-tensor scale clamped away from zero: torchao multiplies by its reciprocal
+        gscale = nvfp4_tensor.per_tensor_amax_to_scale(v.abs().amax()).reshape(1).float().clamp(min=1e-30)
         s, _ = nvfp4_tensor.nvfp4_quantize(v.reshape(-1, v.shape[-1]).contiguous(), 16, gscale)
         return [gscale, s.reshape(*v.shape[:-1], -1)]
-    if k == "mxfp4":
-        s, _ = mx_tensor.to_mx(v, MX_ELEM, 32)
-        return [s]
-    raise ValueError(q)
 
-
-# ---------------------------------------------------------------- codes
-
-def quantize(v, S, q):
-    i = qinfo(q)
-    k = i["kind"]
-    if k == "fp32":
-        return v.float().clone()
-    if k == "bf16":
-        return v.to(torch.bfloat16)
-    if k == "fp16":
-        return v.clamp(-FP16_MAX, FP16_MAX).to(torch.float16)
-    if k == "int8_tok":
-        return torch.round(v / S[0].float()).clamp(-127, 127).to(torch.int8)
-    if k == "fp8_e4m3":
-        return (v / S[0].float()).clamp(-448, 448).to(torch.float8_e4m3fn)
-    if k == "uabs":
-        n = torch.round(v / i["step"])
-        if n.abs().max() > 2 ** 30:
-            raise ValueError(f"{q}: a value exceeds 2^30 steps; use a larger step")
-        n = n.to(torch.int64)
-        z = (n << 1) ^ (n >> 63)                                   # zigzag: 0,-1,1,-2,.. -> 0,1,2,3,..
-        return torch.stack([((z >> (8 * p)) & 0xFF).to(torch.uint8) for p in range(4)])
-    if k == "int":
-        b, qmin, qmax = i["bits"], i["qmin"], i["qmax"]
-        zp = torch.zeros_like(S[0], dtype=torch.int32)
-        c = qp.quantize_affine(v, _block(v, i["group"]), S[0], zp, torch.int8, qmin, qmax)
-        if b == 8:
-            return c
-        return mxk.pack_uint4((c.to(torch.int16) - qmin).to(torch.uint8))
-    if k == "nvfp4":
+    def encode(self, v, S):
         _, lp = nvfp4_tensor.nvfp4_quantize(v.reshape(-1, v.shape[-1]).contiguous(), 16, S[0])
         return lp.reshape(*v.shape[:-1], -1)
-    if k == "mxfp4":
-        _, lp = mx_tensor.to_mx(v, MX_ELEM, 32)
-        return lp
-    raise ValueError(q)
+
+    def decode(self, codes, S):
+        x = mxk.f4_unpacked_to_f32(mxk.unpack_uint4(codes))
+        return x * (S[1].float() * S[0]).repeat_interleave(16, -1)
 
 
-def dequantize(c, S, q):
-    i = qinfo(q)
-    k = i["kind"]
-    if k == "fp32":
-        return c.clone()                                           # never alias the codes stream
-    if k in ("bf16", "fp16"):
-        return c.float()
-    if k in ("int8_tok", "fp8_e4m3"):
-        return c.float() * S[0].float()
-    if k == "uabs":
-        z = torch.zeros(c.shape[1:], dtype=torch.int64, device=c.device)
-        for p in range(4):
-            z |= c[p].to(torch.int64) << (8 * p)
-        n = (z >> 1) ^ -(z & 1)
-        return n.float() * i["step"]
-    if k == "int":
-        b, qmin, qmax = i["bits"], i["qmin"], i["qmax"]
-        codes = c if b == 8 else (mxk.unpack_uint4(c).to(torch.int16) + qmin).to(torch.int8)
-        zp = torch.zeros_like(S[0], dtype=torch.int32)
-        return qp.dequantize_affine(codes, _block(codes, i["group"]), S[0], zp, torch.int8, qmin, qmax,
-                                    output_dtype=torch.float32)
-    if k == "nvfp4":
-        x = mxk.f4_unpacked_to_f32(mxk.unpack_uint4(c))
-        scales = (S[1].float() * S[0]).repeat_interleave(16, -1)
-        return x * scales
-    if k == "mxfp4":
-        return mx_tensor.to_dtype(c, S[0], MX_ELEM, 32, torch.float32)
-    raise ValueError(q)
+QUANTIZERS = [Cast, PerTokenFp8, PerTokenInt8, GroupInt, MXFP4, NVFP4]
+_CACHE = {}
 
+
+def quantizer(name):
+    """Factory: the Quantizer for a name such as "int4_g512" (instances are cached, one per name)."""
+    q = _CACHE.get(name)
+    if q is None:
+        for cls in QUANTIZERS:
+            if isinstance(name, str) and cls.matches(name):
+                q = _CACHE[name] = cls(name)
+                break
+        else:
+            raise ValueError(f"unknown quantizer {name!r}")
+    return q

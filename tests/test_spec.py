@@ -4,7 +4,7 @@ from rescomp import Spec
 
 
 @pytest.mark.parametrize("name", ["fp16", "bf16", "int4_g384+layerK4+out12", "int4_g512+layerK4+out32+key=bf16",
-                                  "uabs0.1+out8", "mxfp4+layerK2+sink1", "nvfp4"])
+                                  "mxfp4+layerK2+sink1", "nvfp4"])
 def test_parse_name_roundtrip(name):
     s = Spec.parse(name)
     assert s.name == name
@@ -28,7 +28,7 @@ def test_redundant_key_dropped_from_name():
     assert Spec(quant="bf16", K=2, key_quant="bf16").name == "bf16+layerK2"
 
 
-@pytest.mark.parametrize("bad", ["int3_g64", "int2_g16", "int4", "fp64", "int4_g64+foo", "int4_g64+key=bf16", "uabs0", "uabs-1",
+@pytest.mark.parametrize("bad", ["int3_g64", "int2_g16", "int4", "fp64", "int4_g64+foo", "int4_g64+key=bf16", "uabs0.1",
                                  "int4_g16+out2+out4", "bf16+layerK1", "int4_g16+layerK2+layerK4"])
 def test_bad_specs(bad):
     with pytest.raises(ValueError):

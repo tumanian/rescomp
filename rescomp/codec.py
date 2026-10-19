@@ -12,7 +12,7 @@ it; `_CodecState` holds what carries over between layers of one chunk.
 """
 import torch
 
-from . import quant as Q
+from .quant import quantizer
 from .bf16_wrapper import OutlierChannels, check_channels, restore, split
 from .spec import Spec
 
@@ -37,7 +37,7 @@ def check_width(spec, i, x, seen):
     d = x.shape[-1]
     if seen is not None and d != seen:
         raise ValueError(f"d changed from {seen} to {d}")
-    Q.check_dim(spec.quant_for(i), d)
+    quantizer(spec.quant_for(i)).check_dim(d)
     if spec.sink > x.shape[1]:
         raise ValueError(f"sink{spec.sink} > T={x.shape[1]}")
     return d
@@ -47,14 +47,15 @@ def check_width(spec, i, x, seen):
 
 def _layer_values(x, prev, O, sink, q, reconstruct):
     """fp32 cast, closed-loop delta, sink rows and outlier channels out, scales, codes and (if asked) the
-    reconstruction with rows and channels restored. Returns (scales, codes, sink_rows, outliers, xhat)."""
+    reconstruction with rows and channels restored. q is a Quantizer. Returns (scales, codes, sink_rows,
+    outliers, xhat)."""
     v = x.to(torch.float32, copy=True) if prev is None else x.float() - prev
     sink_rows, outl = split(v, O, sink)
-    S = Q.make_scales(v, q)
-    codes = Q.quantize(v, S, q)
+    S = q.scales(v)
+    codes = q.encode(v, S)
     if not reconstruct:
         return S, codes, sink_rows, outl, None
-    vhat = restore(Q.dequantize(codes, S, q), O, sink, sink_rows, outl)
+    vhat = restore(q.decode(codes, S), O, sink, sink_rows, outl)
     return S, codes, sink_rows, outl, (vhat if prev is None else prev + vhat)
 
 
@@ -73,7 +74,7 @@ def layer_values(x, prev, O, sink, q, reconstruct, compile=False):
 def reconstruct(streams, q, spec, O):
     """Decoder side: streams -> vhat fp32 [B, T, d], the same ops as the encoder's reconstruction."""
     S = [streams[k] for k in sorted(streams) if k.startswith("scale")]
-    return restore(Q.dequantize(streams["codes"], S, q), O, spec.sink, streams.get("sink"), streams.get("outliers"))
+    return restore(q.decode(streams["codes"], S), O, spec.sink, streams.get("sink"), streams.get("outliers"))
 
 
 # ---------------------------------------------------------------- state across the layers of one chunk
@@ -130,7 +131,7 @@ class Encoder(_CodecState):
         prev = None if spec.is_key(i) else self.prev.to(x.device)        # layers may live on different GPUs
         needed = reconstruct or (spec.K > 1 and not spec.is_key(i + 1) and i + 1 < self.n_layers)
         S, codes, sink_rows, outl, xhat = layer_values(x, prev, self.channel_ids(i, x.device), spec.sink,
-                                                       spec.quant_for(i), needed, self.compile)
+                                                       quantizer(spec.quant_for(i)), needed, self.compile)
         streams = {}
         if sink_rows is not None:
             streams["sink"] = sink_rows
@@ -150,7 +151,7 @@ class Decoder(_CodecState):
         check_order(self.spec, i, self.expect)
         self.expect = i + 1
         spec = self.spec
-        vhat = reconstruct(streams, spec.quant_for(i), spec, self.channel_ids(i, streams["codes"].device))
+        vhat = reconstruct(streams, quantizer(spec.quant_for(i)), spec, self.channel_ids(i, streams["codes"].device))
         xhat = vhat if spec.is_key(i) else self.prev + vhat
         self.prev = xhat
         return xhat

@@ -1,15 +1,18 @@
-"""Lossless stage: byte-shuffle (group the k-th byte of every element together) + zstd.
+"""Lossless stage: the bytes of a code or scale tensor -> compressed bytes, built by `lossless(record)`.
 
-Byte shuffle won 122 of 124 times against bit-shuffle and raw in the earlier sweep, and zstd-3 is within a few
-percent of zstd-19 at a fraction of the CPU time; both are options here.
+One implementation today, ZstdShuffle: byte-shuffle (group the k-th byte of every element together, which won
+122 of 124 times against bit-shuffle and raw in the earlier sweep) then zstd. The header records the backend
+as {"codec": name, ...options}, so another backend is a subclass plus a header value.
 """
+from abc import ABC, abstractmethod
+
 import numpy as np
 import torch
 import zstandard
 
 DTYPES = {"float64": torch.float64, "float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16,
-          "float8_e4m3fn": torch.float8_e4m3fn, "float8_e8m0fnu": torch.float8_e8m0fnu, "int8": torch.int8, "uint8": torch.uint8, "int16": torch.int16,
-          "int32": torch.int32, "int64": torch.int64, "bool": torch.bool}
+          "float8_e4m3fn": torch.float8_e4m3fn, "float8_e8m0fnu": torch.float8_e8m0fnu, "int8": torch.int8,
+          "uint8": torch.uint8, "int16": torch.int16, "int32": torch.int32, "int64": torch.int64, "bool": torch.bool}
 
 
 def check_dtype(t, what):
@@ -21,6 +24,12 @@ def dtype_name(dt):
     return str(dt).removeprefix("torch.")
 
 
+def to_bytes(t):
+    """Any tensor -> (uint8 numpy of its raw bytes, element size)."""
+    t = t.detach().contiguous().cpu()
+    return t.view(torch.uint8).numpy().ravel(), t.element_size()
+
+
 def shuffle(b, elem):
     return b if elem == 1 or len(b) == 0 else b.reshape(-1, elem).T.copy().ravel()
 
@@ -29,36 +38,63 @@ def unshuffle(b, elem):
     return b if elem == 1 or len(b) == 0 else b.reshape(elem, -1).T.copy().ravel()
 
 
-def to_bytes(t):
-    """Any tensor -> (uint8 numpy of its raw bytes, elem size)."""
-    t = t.detach().contiguous().cpu()
-    elem = t.element_size()
-    return t.view(torch.uint8).numpy().ravel(), elem
+class Lossless(ABC):
+    name: str
+
+    @abstractmethod
+    def compress(self, t):
+        """tensor -> (compressed bytes, raw byte count)."""
+
+    @abstractmethod
+    def decompress(self, blob, dtype, shape, raw_nbytes):
+        """compressed bytes -> tensor of dtype/shape (CPU)."""
+
+    @abstractmethod
+    def to_dict(self):
+        ...
 
 
-def compress(t, level=3, shuffled=True):
-    """tensor -> (compressed bytes, raw byte count)."""
-    b, elem = to_bytes(t)
-    if shuffled:
-        b = shuffle(b, elem)
-    return zstandard.ZstdCompressor(level=level).compress(b.tobytes()), len(b)
+class ZstdShuffle(Lossless):
+    name = "zstd"
+
+    def __init__(self, level=3, shuffle=True):
+        self.level, self.shuffle = int(level), bool(shuffle)
+
+    def to_dict(self):
+        return {"codec": self.name, "level": self.level, "shuffle": self.shuffle}
+
+    def compress(self, t):
+        b, elem = to_bytes(t)
+        if self.shuffle:
+            b = shuffle(b, elem)
+        return zstandard.ZstdCompressor(level=self.level).compress(b.tobytes()), len(b)
+
+    def decompress(self, blob, dtype, shape, raw_nbytes):
+        if isinstance(dtype, str):
+            if dtype not in DTYPES:
+                raise ValueError(f"unknown stored dtype {dtype!r}")
+            dtype = DTYPES[dtype]
+        elem = torch.empty(0, dtype=dtype).element_size()
+        b = np.frombuffer(zstandard.ZstdDecompressor().decompress(blob, max_output_size=raw_nbytes), np.uint8)
+        if len(b) != raw_nbytes:
+            raise ValueError(f"decompressed {len(b)} bytes, expected {raw_nbytes}")
+        if self.shuffle:
+            b = unshuffle(b, elem)
+        if raw_nbytes == 0:
+            return torch.empty(list(shape), dtype=dtype)
+        if not b.flags.writeable:                                # zstd's buffer is read-only; unshuffle already copied
+            b = b.copy()
+        return torch.from_numpy(b).view(dtype).reshape(list(shape))
 
 
-def decompress(blob, dtype, shape, raw_nbytes, shuffled=True):
-    """compressed bytes -> tensor of dtype/shape (CPU)."""
-    if isinstance(dtype, str):
-        if dtype not in DTYPES:
-            raise ValueError(f"unknown stored dtype {dtype!r}")
-        dtype = DTYPES[dtype]
-    dt = dtype
-    elem = torch.empty(0, dtype=dt).element_size()
-    b = np.frombuffer(zstandard.ZstdDecompressor().decompress(blob, max_output_size=raw_nbytes), np.uint8)
-    if len(b) != raw_nbytes:
-        raise ValueError(f"decompressed {len(b)} bytes, expected {raw_nbytes}")
-    if shuffled:
-        b = unshuffle(b, elem)
-    if raw_nbytes == 0:
-        return torch.empty(list(shape), dtype=dt)
-    if not b.flags.writeable:                                    # zstd's buffer is read-only; unshuffle already copied
-        b = b.copy()
-    return torch.from_numpy(b).view(dt).reshape(list(shape))
+BACKENDS = {ZstdShuffle.name: ZstdShuffle}
+
+
+def lossless(record=None, **options):
+    """Factory: from a header record {"codec": "zstd", "level": 3, "shuffle": True} or keyword options."""
+    rec = dict(record or {})
+    rec.update(options)
+    name = rec.pop("codec", "zstd")
+    if name not in BACKENDS:
+        raise ValueError(f"unknown lossless backend {name!r}; have {sorted(BACKENDS)}")
+    return BACKENDS[name](**rec)
