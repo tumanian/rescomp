@@ -63,6 +63,16 @@ class Quantizer(ABC):
         return f"{type(self).__name__}({self.name!r})"
 
 
+def fp16_inexact(x):
+    """A 0-d bool on x's device: whether an fp16 cast loses what the model has. bf16 / fp16 inputs: any value that
+    changes (range, or bf16 values below fp16's normal range). Wider inputs: only values outside fp16's range
+    (above 65504 in magnitude, or non-zero and flushed to zero); rounding to fp16's mantissa is the cast's job."""
+    h = x.to(torch.float16).float()
+    if x.dtype in (torch.bfloat16, torch.float16):
+        return (h != x.float()).any()
+    return ((x.abs() > FP16_MAX) | ((x != 0) & (h == 0))).any()
+
+
 def _half_scale(amax, qmax):
     return (amax / qmax).clamp(min=FP16_TINY).half()
 

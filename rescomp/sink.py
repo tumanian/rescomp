@@ -22,26 +22,32 @@ the model says it is using a cache (HF: past_key_values / cache_position) or, la
 previous call had the same batch size.
 """
 import time
+import warnings
 
 import torch
 
 from .bf16_wrapper import OutlierChannels, check_channels, choose_layer_channels
 from .codec import Encoder
 from .hooks import CallHooks, Layers, extract_tokens_generic  # noqa: F401  (re-exported for callers)
+from .quant import fp16_inexact
 from .regimes import is_regime, needs_width, resolve
-from .store import Store
+from .store import Store, check_annotation_names
 
 
 class Sink:
     def __init__(self, stem, layers, spec, *, tokens=None, channels=None, buffer_bytes=1 << 30, rotate_bytes=None,
-                 level=3, site="resid_post", extra=None, model_info=None, fidelity=False, compile=False,
-                 bucket=None, prefix=None, s3=None):
+                 level=3, site="resid_post", extra=None, model_info=None, fidelity=False, compile=False, check_exact=None,
+                 overwrite=False, bucket=None, prefix=None, s3=None):
         """stem: a local path stem, an s3://bucket/prefix/name URI, or a name with bucket= and prefix= (see
-        rescomp.store.location). fidelity=True also measures each layer's reconstruction error in the hook (an extra
-        reconstruction and three reductions per layer, in fp32): useful once, costly on every forward.
-        compile=True runs the quantizer through torch.compile (fused kernels; a one-time compile per shape class)."""
+        rescomp.store.location); an existing capture there is an error unless overwrite=True. fidelity=True also
+        measures each layer's reconstruction error in the hook (an extra reconstruction and three reductions per
+        layer, in fp32): useful once, costly on every forward. compile=True runs the quantizer through torch.compile
+        (fused kernels; a one-time compile per shape class). check_exact (default: on for the `exact` regime) checks
+        every call that fp16 holds this model's values (bf16 / fp16 models: exactly; wider: within range) and raises
+        otherwise; see rescomp.quant.fp16_inexact."""
         if tokens not in (None, "off"):
             raise ValueError("tokens must be None (pre-hook) or 'off'")
+        self.check_exact = (spec == "exact") if check_exact is None else bool(check_exact)
         self._spec_arg = spec
         self.spec = None if needs_width(spec) else resolve(spec)     # regimes resolve on the first call (need d)
         self.hooks = CallHooks(layers, on_layer=self._on_layer, on_end=self._complete_call, tokens=tokens is None)
@@ -54,7 +60,7 @@ class Sink:
         info.update(model_info or {})
         info.setdefault("n_layers", L.n_layers)
         self.store = Store(stem, model=info, layers=self.order, spec=self.spec, channels=channels, site=site, level=level,
-                           hook_names=L.hook_names, extra=dict(extra or {}), rotate_bytes=rotate_bytes,
+                           hook_names=L.hook_names, extra=dict(extra or {}), rotate_bytes=rotate_bytes, overwrite=overwrite,
                            bucket=bucket, prefix=prefix, s3=s3)
         self.store.regime = spec if is_regime(spec) else None
         self.enc = None
@@ -80,6 +86,7 @@ class Sink:
     def annotate(self, **cols):
         """Labels for the sequences the next new-sequence call starts: each value a list/tensor of length B, or a
         scalar for all of them."""
+        check_annotation_names(cols)
         self._pending_ann.update(cols)
 
     def flush(self):
@@ -110,12 +117,17 @@ class Sink:
         """Encode this layer now, on its device, so the model can free the activation as usual."""
         i = self.order.index(l)
         if i == 0:
-            call["shape"], call["streams"], call["err"] = tuple(x.shape), {}, {}
+            call["shape"], call["streams"], call["err"], call["inexact"] = tuple(x.shape), {}, {}, {}
             self._encoder_for(x)
         if "shape" not in call or tuple(x.shape) != call["shape"]:
-            return                                     # a layer fired without the first one (or shapes changed): drop the call
+            warnings.warn(f"rescomp: layer {l} fired with shape {tuple(x.shape)} "
+                          + ("before the first hooked layer" if "shape" not in call else f"after shape {call['shape']}")
+                          + "; this forward call is not recorded", stacklevel=2)
+            return
         if self._choosing:
             self._choose_channels(i, x)
+        if self.check_exact:                           # a 0-d flag on the device; read once per call in _complete_call
+            call["inexact"][l] = fp16_inexact(x)
         st, xhat = self.enc.encode_layer(i, x, reconstruct=self.fidelity)
         if self.fidelity:
             xf = x.float()
@@ -133,6 +145,12 @@ class Sink:
             self.hooks.n_incomplete += 1
             self.hooks.n_calls -= 1
             return
+        if self.check_exact:
+            bad = [l for l in self.order if bool(call["inexact"][l])]
+            if bad:
+                raise ValueError(f"the exact regime (fp16) cannot hold layer(s) {bad} of this call: a value is above 65504 "
+                                 "in magnitude or too small for fp16; use spec='bf16' (exact for any bf16 model, at a "
+                                 "lower ratio) or check_exact=False to accept fp16's clamping")
         B, T, d = call["shape"]
         cont = call["cont"]
         if cont is None:

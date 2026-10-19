@@ -8,8 +8,7 @@ import rescomp as rc
 from rescomp import instrument as I
 from rescomp.hooks import Layers
 from rescomp.sink import Sink
-from tests.test_generic import D, L, V
-from tests.test_generic import ToyLM
+from tests.test_generic import ToyLM, V
 from tests.test_sink import layers_of
 
 
@@ -47,7 +46,7 @@ def test_store_backed_patcher_matches_live(lm, toks, tmp_path):
     """Patching from the file gives the same logits as patching live with the same spec on the same data."""
     stem = str(tmp_path / "s")
     spec = "int4_g16+layerK2+out2"
-    with Sink(stem, layers_of(lm), spec) as sink:
+    with Sink(stem, layers_of(lm), spec):
         lm(toks[:4])
         lm(toks[4:])
     r = rc.open(stem)

@@ -29,7 +29,7 @@ def test_bind_and_forward(tiny_model, fake_tok, tmp_path):
     toks = torch.randint(2, 256, (5, 10), generator=torch.Generator().manual_seed(0))
     mask = torch.ones(5, 10, dtype=torch.long)
     mask[4, 7:] = 0
-    with rc.Sink(str(tmp_path / "hf"), L, "int4_g16+layerK2+out2") as sink:
+    with rc.Sink(str(tmp_path / "hf"), L, "int4_g16+layerK2+out2"):
         tiny_model(input_ids=toks[:3], attention_mask=mask[:3])
         tiny_model(toks[3:], attention_mask=mask[3:])
     with rc.open(str(tmp_path / "hf")) as r:
@@ -62,7 +62,7 @@ def test_generate_with_kv_cache(tiny_model, fake_tok, tmp_path):
 
 def test_generate_single_layer(tiny_model, fake_tok, tmp_path):
     prompt = torch.randint(2, 256, (1, 3))
-    with rc.Sink(str(tmp_path / "geni"), rc.bind(tiny_model, [3], tokenizer=fake_tok), "bf16") as sink:
+    with rc.Sink(str(tmp_path / "geni"), rc.bind(tiny_model, [3], tokenizer=fake_tok), "bf16"):
         out = tiny_model.generate(prompt, max_new_tokens=4, do_sample=False, pad_token_id=1)
     with rc.open(str(tmp_path / "geni")) as r:
         assert r.header["n_chunks"] == 4 and r.n_seq == 1 and r.read(3, 0).shape == (6, 64)
@@ -74,7 +74,7 @@ def test_tl_layers_if_installed(tmp_path):
     cfg = tl.HookedTransformerConfig(n_layers=2, d_model=16, d_head=8, n_heads=2, d_mlp=32, d_vocab=40, n_ctx=16, act_fn="gelu")
     m = tl.HookedTransformer(cfg).eval()
     toks = torch.randint(0, 40, (2, 8))
-    with rc.Sink(str(tmp_path / "tl"), rc.bind(m, [0, 1]), "bf16") as sink:
+    with rc.Sink(str(tmp_path / "tl"), rc.bind(m, [0, 1]), "bf16"):
         m(toks)
     with rc.open(str(tmp_path / "tl")) as r:
         assert r.n_seq == 2 and torch.equal(torch.stack(r.tokens()), toks) and r.read(1, 0).shape == (8, 16)

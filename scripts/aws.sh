@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the evaluation on the existing GPU box (g5.xlarge, A10G 24 GB, i-02b17b44a3cb0641f, us-west-2; the 250 GB
+# Run the evaluation on an existing GPU box (g5.xlarge, A10G 24 GB, us-west-2; BOX_ID=<instance id> names it; its
 # disk holds the HF model cache and a ~/venv with CUDA torch + transformers from the earlier experiments).
 # Needs a live AWS session: `aws login` first.
 #   scripts/aws.sh start                 # start the stopped box, record its IP, open SSH from this IP
@@ -18,11 +18,11 @@ HERE=$(cd "$(dirname "$0")/.." && pwd)
 export AWS_REGION=${AWS_REGION:-us-west-2}
 BOX=${BOX:-main}
 STATE=$HERE/scripts/.box$([ "$BOX" = main ] || echo "-$BOX")
-if [ "$BOX" = main ]; then ID=${BOX_ID:-i-02b17b44a3cb0641f}; else ID=$(cat "$STATE.id" 2>/dev/null || true); fi
+if [ "$BOX" = main ]; then ID=${BOX_ID:?set BOX_ID to the main box's instance id}; else ID=$(cat "$STATE.id" 2>/dev/null || true); fi
 KEY=$HOME/.ssh/sae-cpu.pem
 ip() { cat "$STATE.ip"; }
 SSH() { ssh -i "$KEY" -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 ubuntu@"$(ip)" "$@"; }
-push() { rsync -az --delete -e "ssh -i $KEY -o StrictHostKeyChecking=accept-new" --exclude .venv --exclude results --include 'tests/data/*.rsc' --exclude '*.rsc' \
+push() { rsync -az --delete -e "ssh -i $KEY -o StrictHostKeyChecking=accept-new" --exclude .venv --exclude results --exclude '*.rsc' \
            --exclude __pycache__ --exclude .pytest_cache --exclude logs --exclude 'scripts/.box*' "$HERE/" "ubuntu@$(ip):rescomp/"; }
 cmd=$1; shift
 case $cmd in

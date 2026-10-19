@@ -10,8 +10,6 @@ produces the `Layers` record the Sink and the Patcher hook.
 """
 from abc import ABC, abstractmethod
 
-import torch
-
 from .hooks import Layers, extract_tokens_generic
 
 

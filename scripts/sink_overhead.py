@@ -15,8 +15,8 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import rescomp as rc                                   # noqa: E402
-from rescomp.hf import load_model                      # noqa: E402
+import rescomp as rc  # noqa: E402
+from rescomp.hf import load_model  # noqa: E402
 
 
 def timed(fn, n, sync):

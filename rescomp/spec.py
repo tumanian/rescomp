@@ -10,10 +10,7 @@ key       hybrid: a different quantizer for keyframe layers (e.g. key=bf16 keeps
 
 Examples: "fp16", "bf16", "int4_g384+layerK4+out12", "int4_g512+layerK4+out32+key=bf16".
 """
-import re
-from dataclasses import dataclass, asdict
-from typing import Optional
-
+from dataclasses import asdict, dataclass
 
 
 def check_quant(q):
@@ -28,7 +25,7 @@ class Spec:
     K: int = 0                       # keyframe interval for layer deltas; 0 = no deltas
     outliers: int = 0
     sink: int = 0
-    key_quant: Optional[str] = None  # quantizer for keyframes; None = same as quant
+    key_quant: str | None = None  # quantizer for keyframes; None = same as quant
 
     def __post_init__(self):
         check_quant(self.quant)
