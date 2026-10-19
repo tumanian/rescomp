@@ -500,6 +500,32 @@ class Reader:
             mask[i, : p.shape[0]] = True
         return out, mask
 
+    @property
+    def pooled_rows(self):
+        """The row names of a pooled capture (written by a TransformSink), or None for a full capture."""
+        rec = self.header["extra"].get("pooled")
+        return None if rec is None else list(rec["rows"])
+
+    def pooled(self, layer, which="mean", seqs=None, dtype=torch.float32):
+        """[N, d]: one row per sequence, in sequence order. On a pooled capture the stored row `which` ("mean",
+        "last", ...); on a full capture the same row computed from the stored tokens with the attention mask
+        (rescomp.transforms), so a probe reads either kind of capture the same way."""
+        ids = self._ids(seqs)
+        parts = self.read(layer, ids)
+        rows = self.pooled_rows
+        if rows is not None:
+            if which not in rows:
+                raise KeyError(f"{self.stem} holds the pooled rows {rows}, not {which!r}")
+            j = rows.index(which)
+            out = [p[j] for p in parts]
+        else:
+            from .transforms import transform
+            tf = transform(which)
+            if tf.k != 1:
+                raise ValueError(f"pooled() takes one row name at a time, not {which!r}")
+            out = [tf(p[None], None if m is None else m[None])[0, 0] for p, m in zip(parts, self.attention_mask(ids))]
+        return torch.stack(out).to(dtype) if out else torch.empty(0, self.d, dtype=dtype)
+
     def tokens(self, seqs=None):
         """Token ids per sequence (list of LongTensors, or None where no tokens were recorded)."""
         rows = [self._seq_rows[s] for s in self._ids(seqs)]
@@ -534,6 +560,8 @@ class Reader:
             lines.append(f"  layer {l['layer']:3d} {l['quant']:10s} {'key' if l['keyframe'] else 'delta':5s} "
                          + (f"rel L2 {f:.3e}" if f is not None else "rel L2 -")
                          + (f" outliers {l['outlier_channels']}" if l["outlier_channels"] else ""))
+        if self.pooled_rows is not None:
+            lines.append(f"pooled rows per sequence (TransformSink): {', '.join(self.pooled_rows)}")
         if self.annotations:
             lines.append("annotations: " + ", ".join(self.annotations))
         return "\n".join(lines)

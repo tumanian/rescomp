@@ -12,6 +12,8 @@ from .spec import Spec
 from .codec import Codec
 from .store import Store, Reader, transcode, is_capture
 from .sink import Sink
+from .transform_sink import TransformSink
+from .transforms import transform
 from .hooks import Layers
 from .bindings import ModelBinding, ModuleBinding, bind
 from .regimes import REGIMES, resolve as resolve_spec
@@ -23,4 +25,4 @@ def open(stem, verify=True, bucket=None, prefix=None, s3=None):
     return Reader(stem, verify=verify, bucket=bucket, prefix=prefix, s3=s3)
 
 
-__all__ = ["Codec", "Spec", "Store", "Reader", "transcode", "is_capture", "open", "Sink", "Layers", "ModelBinding", "ModuleBinding", "bind", "REGIMES", "resolve_spec", "__version__"]
+__all__ = ["Codec", "Spec", "Store", "Reader", "transcode", "is_capture", "open", "Sink", "TransformSink", "transform", "Layers", "ModelBinding", "ModuleBinding", "bind", "REGIMES", "resolve_spec", "__version__"]
