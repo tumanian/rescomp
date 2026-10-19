@@ -1,4 +1,4 @@
-"""Format 2: rotated blob files + Parquet tables, written by Store and read back by Reader2."""
+"""Format 3: rotated blob files + Parquet tables, written by Store and read back by Reader."""
 import os
 
 import numpy as np
@@ -44,7 +44,7 @@ def write_store(stem, spec="int4_g16+layerK2+out2", rotate_bytes=4 << 30, chunks
 def test_roundtrip(tmp_path):
     stem = str(tmp_path / "run")
     acts, tokens, expect = write_store(stem)
-    assert S.is_v2(stem) and not S.is_v2(str(tmp_path / "nope"))
+    assert S.is_capture(stem) and not S.is_capture(str(tmp_path / "nope"))
     assert sorted(os.path.basename(p) for p in os.listdir(tmp_path)) == [
         "run.00000.rsc", "run.blobs.parquet", "run.chunks.parquet", "run.meta.parquet", "run.tokens.parquet"]
     with S.Reader(stem) as r:
@@ -63,7 +63,7 @@ def test_roundtrip(tmp_path):
         assert torch.equal(r.annotation("vec", 1), torch.tensor([1, 2, 3]))
         padded, mask = r.read_padded(8, [0, 1])
         assert padded.shape == (2, 8, 64) and mask.all()
-        assert "run: RSC2 v2" in r.summary() and "annotations: doc_id, tag, vec" in r.summary()
+        assert "run: RSC3 v3" in r.summary() and "annotations: doc_id, tag, vec" in r.summary()
         assert r.sequences().num_rows == 10 and abs(r.header["fidelity"]["rel_l2"] - float((expect - acts).norm() / acts.norm())) < 1e-6
         with pytest.raises(KeyError):
             r.read(7)
@@ -75,7 +75,7 @@ def test_rotation(tmp_path):
     stem = str(tmp_path / "rot")
     acts, tokens, expect = write_store(stem, rotate_bytes=4000)
     files = sorted(p for p in os.listdir(tmp_path) if p.endswith(".rsc"))
-    assert len(files) > 1 and all(os.path.getsize(tmp_path / f) >= S.HEAD2 for f in files)
+    assert len(files) > 1 and all(os.path.getsize(tmp_path / f) >= S.FILE_HEAD for f in files)
     with S.Reader(stem) as r:
         assert r.header["n_files"] == len(files)
         assert set(b["file"] for v in r.blobs.values() for b in v.values()) == set(range(len(files)))
@@ -166,7 +166,7 @@ def test_corruption_detected(tmp_path):
 
 
 def test_parquet_schema(tmp_path):
-    from rescomp.storage import location
+    from rescomp.store import location
     stem = location(str(tmp_path / "s"))
     write_store(stem.path)
     t = pq.read_table(S.table_path(stem, "tokens"))
@@ -189,14 +189,14 @@ def test_open(tmp_path):
 def test_transcode(tmp_path):
     src, dst = str(tmp_path / "src"), str(tmp_path / "dst")
     acts, tokens, _ = write_store(src, spec="fp32")
-    st = rc.transcode(src, dst, "int4_g16+layerK2+out2", calib_seqs=4)
+    st = rc.transcode(src, dst, "int4_g16+layerK2+out2", sample_seqs=4)
     assert st["chunks"] == 3 and st["ratio"] > 2
     spec = rc.Spec.parse("int4_g16+layerK2+out2")
     with rc.open(dst) as r:
         assert r.spec == spec and r.header["extra"]["source_spec"] == "fp32" and r.n_seq == 10
         assert torch.equal(torch.stack(r.tokens()), tokens) and r.annotation("doc_id") == [10 * i for i in range(10)]
         assert r.header["outlier_channels"]["source"].startswith("first ")
-        for a, n in ((0, 3), (3, 5), (8, 2)):              # chunk-wise re-encoding with the file's own calibration
+        for a, n in ((0, 3), (3, 5), (8, 2)):              # chunk-wise re-encoding with the file's own outlier channels
             exp = rc.encode(acts[:, a: a + n], spec, r.channels)[1]
             assert torch.equal(torch.stack(r.read(9, list(range(a, a + n)))), exp[1])
     rc.transcode(src, str(tmp_path / "x"), "compact")

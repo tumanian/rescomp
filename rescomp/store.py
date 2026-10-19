@@ -1,4 +1,4 @@
-"""Storage, format version 2: tensors apart from metadata, on the local disk or in S3 (see rescomp.storage).
+"""Storage, format version 3: tensors apart from metadata, on the local disk or in S3.
 
     <stem>.00000.rsc, <stem>.00001.rsc, ...   append-only files of compressed tensor blobs, rotated at a size limit
     <stem>.meta.parquet                        one row: model, spec, outlier channels, stored layers, fidelity, byte counts
@@ -8,7 +8,19 @@
 
 A chunk is one encoded batch [L, B, T, d]: B sequences (ids `seq_ids`), each contributing T tokens starting at
 its position `starts[i]`. A sequence may span several chunks (a prompt chunk, then one chunk per generated token);
-`Reader2.read` concatenates them. Chunks are encoded independently, so any chunk can be decoded alone.
+`Reader.read` concatenates them. Chunks are encoded independently, so any chunk can be decoded alone.
+
+Where a capture lives is a `Location` behind pyarrow's filesystem layer:
+
+    location("runs/run1")                                  -> local files runs/run1.*
+    location("s3://bucket/prefix/run1")                    -> objects prefix/run1.* in bucket
+    location("run1", bucket="bucket", prefix="prefix")     -> the same
+    s3={"region": ..., "endpoint_override": ..., "access_key": ..., ...}   -> pyarrow.fs.S3FileSystem options
+      (credentials otherwise come from the usual AWS environment / profile / instance role)
+
+S3 fits the layout: tensor files are immutable once closed (each flush closes the current one, so a capture
+is readable mid-run), the Parquet tables are small whole-object rewrites, and blob reads are offset-plus-length
+range requests.
 
 `Store` takes already-encoded streams (the Sink owns the encoder); `Reader` decodes; `transcode` re-encodes a
 stored capture with another spec without the model.
@@ -19,9 +31,11 @@ import struct
 import time
 import zlib
 from collections import defaultdict
+from dataclasses import dataclass
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.fs as pafs
 import pyarrow.parquet as pq
 import torch
 
@@ -32,11 +46,55 @@ from .bf16_wrapper import OutlierChannels, check_channels, choose_channels
 from .codec import Decoder, Encoder
 from .quant import CODEC_VERSION
 from .spec import Spec
-from .storage import Location, location
 
-MAGIC2 = b"RSC2"
-VERSION2 = 2
-HEAD2 = len(MAGIC2) + 4
+FORMAT = b"RSC3"
+FORMAT_VERSION = 3
+FILE_HEAD = len(FORMAT) + 4          # each .rsc file starts with the magic and the format version
+S3_ROTATE_BYTES = 1 << 30            # objects of at most 1 GiB: a few multipart parts, cheap to re-upload or re-fetch
+LOCAL_ROTATE_BYTES = 4 << 30
+
+
+# ---------------------------------------------------------------- where a capture lives
+
+@dataclass
+class Location:
+    fs: pafs.FileSystem
+    path: str            # the stem's path inside fs (no scheme)
+    remote: bool
+    uri: str             # how to print it
+
+    @property
+    def rotate_default(self):
+        return S3_ROTATE_BYTES if self.remote else LOCAL_ROTATE_BYTES
+
+    def exists(self, path):
+        return self.fs.get_file_info(path).type != pafs.FileType.NotFound
+
+    def ensure_dir(self):
+        if not self.remote:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+
+
+def location(stem, bucket=None, prefix=None, s3=None):
+    if isinstance(stem, Location):
+        return stem
+    stem = str(stem)
+    if bucket is None and stem.startswith("s3://"):
+        bucket, _, rest = stem[5:].partition("/")
+        prefix, _, stem = rest.rpartition("/")
+    if bucket is None:
+        path = os.path.abspath(stem)
+        return Location(pafs.LocalFileSystem(), path, False, path)
+    if not stem or "/" in stem.strip("/"):
+        raise ValueError(f"the stem on S3 must be a plain name (got {stem!r}); put directories in prefix=")
+    opts = dict(s3 or {})
+    if "region" not in opts and "endpoint_override" not in opts:
+        try:
+            opts["region"] = pafs.resolve_s3_region(bucket)
+        except Exception:
+            pass
+    key = "/".join(p for p in [(prefix or "").strip("/"), stem.strip("/")] if p)
+    return Location(pafs.S3FileSystem(**opts), f"{bucket}/{key}", True, f"s3://{bucket}/{key}")
 
 
 def table_path(loc, name):
@@ -47,9 +105,29 @@ def blob_path(loc, n):
     return f"{loc.path}.{n:05d}.rsc"
 
 
-def is_v2(stem, bucket=None, prefix=None, s3=None):
-    loc = stem if isinstance(stem, Location) else location(stem, bucket, prefix, s3)
+def is_capture(stem, bucket=None, prefix=None, s3=None):
+    """Whether a capture exists at this stem (its meta table does)."""
+    loc = location(stem, bucket, prefix, s3)
     return loc.exists(table_path(loc, "meta"))
+
+
+# ---------------------------------------------------------------- validators
+
+def check_layers(layers):
+    """The stored layers: a non-empty, strictly increasing list of ints."""
+    layers = [int(l) for l in layers]
+    if not layers or layers != sorted(set(layers)):
+        raise ValueError("layers must be a non-empty, strictly increasing list")
+    return layers
+
+
+def check_streams(streams, n_layers):
+    """One stream dict per stored layer, each with its codes."""
+    if len(streams) != n_layers:
+        raise ValueError(f"got {len(streams)} layers, store has {n_layers}")
+    for st in streams:
+        if "codes" not in st:
+            raise ValueError("each layer's streams must include its codes")
 
 
 # ---------------------------------------------------------------- blob files
@@ -71,14 +149,14 @@ class BlobFiles:
         self.close()
         self.n += 1
         self.f = self.loc.fs.open_output_stream(blob_path(self.loc, self.n))
-        self.f.write(MAGIC2 + struct.pack("<I", VERSION2))
-        self.pos = HEAD2
+        self.f.write(FORMAT + struct.pack("<I", FORMAT_VERSION))
+        self.pos = FILE_HEAD
         self.files.append(blob_path(self.loc, self.n))
 
     def append(self, t):
         t = t.detach() if isinstance(t, torch.Tensor) else torch.as_tensor(np.asarray(t))
         comp, raw = self.codec.compress(t)
-        if self.f is None or (self.pos > HEAD2 and self.pos + len(comp) > self.rotate_bytes):
+        if self.f is None or (self.pos > FILE_HEAD and self.pos + len(comp) > self.rotate_bytes):
             self._open_new()
         self.f.write(comp)
         rec = {"file": self.n, "offset": self.pos, "nbytes": len(comp), "raw_nbytes": raw, "crc32": zlib.crc32(comp),
@@ -130,7 +208,7 @@ def _from_arrow(value):
 # ---------------------------------------------------------------- writer
 
 class Store:
-    """Format-2 writer. Give it encoded chunks and per-sequence tokens; call flush() to make the files readable."""
+    """The writer. Give it encoded chunks and per-sequence tokens; call flush() to make the files readable."""
 
     def __init__(self, stem, *, model, layers, spec=None, channels=None, site="resid_post", level=3, shuffle=True,
                  hook_names=None, extra=None, rotate_bytes=None, bucket=None, prefix=None, s3=None):
@@ -141,9 +219,7 @@ class Store:
         self.loc = location(stem, bucket, prefix, s3)
         self.stem = self.loc.uri
         self.spec = None if spec is None else Spec.parse(spec)
-        self.layers = [int(l) for l in layers]
-        if not self.layers or self.layers != sorted(set(self.layers)):
-            raise ValueError("layers must be a non-empty, strictly increasing list")
+        self.layers = check_layers(layers)
         self.channels = channels
         self.chunk_rows, self.blob_rows = [], []
         if self.spec is not None:
@@ -202,8 +278,7 @@ class Store:
             raise ValueError("store is closed")
         if self.spec is None:
             raise ValueError("set_spec() before the first chunk")
-        if len(streams) != len(self.layers):
-            raise ValueError(f"got {len(streams)} layers, store has {len(self.layers)}")
+        check_streams(streams, len(self.layers))
         T = int(streams[0]["codes"].shape[-2] if streams[0]["codes"].dim() >= 3 else 0)
         cid = len(self.chunk_rows)
         for i, st in enumerate(streams):
@@ -238,7 +313,7 @@ class Store:
                                 "max_abs": float(self.maxabs[i]) if self.n_measured else None}} for i, l in enumerate(self.layers)]
         total = float(self.ss.sum())
         n_tok = sum(c["n_tokens"] * c["n_seq"] for c in self.chunk_rows)
-        return {"format": MAGIC2.decode(), "version": VERSION2, "codec": CODEC_VERSION, "library": f"rescomp {__version__}",
+        return {"format": FORMAT.decode(), "version": FORMAT_VERSION, "codec": CODEC_VERSION, "library": f"rescomp {__version__}",
                 "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "model": json.dumps(self.model),
                 "spec": self.spec.name if self.spec else None, "regime": self.regime,
                 "outlier_channels": json.dumps((self.channels or OutlierChannels(None, "none")).to_dict()),
@@ -317,7 +392,7 @@ class Reader:
     def __init__(self, stem, verify=True, bucket=None, prefix=None, s3=None):
         self.loc = location(stem, bucket, prefix, s3)
         self.stem, self.verify = self.loc.uri, verify
-        if not is_v2(self.loc):
+        if not is_capture(self.loc):
             raise ValueError(f"{self.stem}: no {os.path.basename(table_path(self.loc, 'meta'))} (a capture is opened by its stem)")
         fs = self.loc.fs
         m = pq.read_table(table_path(self.loc, "meta"), filesystem=fs).to_pylist()[0]
@@ -325,8 +400,8 @@ class Reader:
         self.header = dict(m, model=json.loads(m["model"]), outlier_channels=json.loads(m["outlier_channels"]), lossless=json.loads(m["lossless"]),
                            layers=json.loads(m["layers"]), fidelity=json.loads(m["fidelity"]), extra=json.loads(m["extra"]),
                            bytes=json.loads(m["bytes"]))
-        if m["version"] > VERSION2:
-            raise ValueError(f"file version {m['version']} is newer than this library ({VERSION2})")
+        if m["version"] != FORMAT_VERSION:
+            raise ValueError(f"{self.stem}: format version {m['version']}; this library reads {FORMAT_VERSION}")
         if m.get("codec", 1) != CODEC_VERSION:
             raise ValueError(f"{self.stem}: codec version {m.get('codec', 1)}; this library decodes {CODEC_VERSION}")
         self.spec = Spec.parse(m["spec"])
@@ -478,25 +553,29 @@ class Reader:
         return "\n".join(lines)
 
 
+def _sample_channels(r, spec, n_seqs):
+    """Outlier channels for `spec` from the stored activations of the chunks holding the first n_seqs sequences
+    (chunks are rectangular, so whole chunks are taken)."""
+    chunks, seen = [], set()
+    for c in r.chunks:
+        if len(seen) >= n_seqs:
+            break
+        chunks.append(c["chunk"])
+        seen.update(c["seq_ids"])
+    sample = [torch.cat([r._decode_chunk(ci, i)[i].flatten(0, 1) for ci in chunks]) for i in range(len(r.layers))]
+    return choose_channels(torch.stack(sample).unsqueeze(1), spec, source=f"first {len(seen)} sequences of {os.path.basename(r.stem)}")
+
+
 @torch.no_grad()
-def transcode(src, dst, spec, calib_seqs=32, level=3, rotate_bytes=None, extra=None, src_loc=None, dst_loc=None):
+def transcode(src, dst, spec, sample_seqs=32, level=3, rotate_bytes=None, extra=None, src_loc=None, dst_loc=None):
     """Re-encode a stored capture with another spec, chunk by chunk, without the model. Meant for a lossless
     source (exact / bf16); the source spec and its measured error are recorded in the new header's extra.
+    Outlier channels (+out) are chosen on the first `sample_seqs` sequences of the source.
     src_loc / dst_loc: {"bucket": ..., "prefix": ..., "s3": {...}} for either end. Returns the new Store's stats."""
     from .regimes import resolve
     with Reader(src, **(src_loc or {})) as r:
         spec = resolve(spec, r.d)
-        channels = None
-        if spec.outliers:
-            # choose the outlier channels on the chunks that hold the first calib_seqs sequences (chunks are rectangular)
-            chunks, seen = [], set()
-            for c in r.chunks:
-                if len(seen) >= calib_seqs:
-                    break
-                chunks.append(c["chunk"])
-                seen.update(c["seq_ids"])
-            sample = [torch.cat([r._decode_chunk(ci, i)[i].flatten(0, 1) for ci in chunks]) for i in range(len(r.layers))]
-            channels = choose_channels(torch.stack(sample).unsqueeze(1), spec, source=f"first {len(seen)} sequences of {os.path.basename(r.stem)}")
+        channels = _sample_channels(r, spec, sample_seqs) if spec.outliers else None
         ex = dict(r.header["extra"])
         ex.update({"transcoded_from": r.stem, "source_spec": r.spec.name,
                    "source_rel_l2": r.header["fidelity"]["rel_l2"]}, **(extra or {}))

@@ -76,7 +76,7 @@ def main():
     L = bind(model, a.layers, tokenizer=tok, model_id=a.model, revision=a.revision)
     run = lambda t: model(t.to(dev), use_cache=False).logits
     base = str(out / "base")
-    if not rc.is_v2(base):
+    if not rc.is_capture(base):
         with rc.Sink(base, L, "exact", level=a.level, extra={"corpus": f"wikitext-103-raw-v1 {a.dataset_split}", "seed": 0}), torch.no_grad():
             for i in range(0, a.n_seq, a.batch):
                 model(tokens[i: i + a.batch].to(dev), use_cache=False)
@@ -98,11 +98,11 @@ def main():
             if (not want_per or "per_layer_eval" in rec) and (not want_coh or "coherence" in rec):
                 print(f"skip {spec} (done)")
                 continue
-            if not rc.is_v2(stem):
-                rc.transcode(base, stem, spec, calib_seqs=32, level=a.level)
+            if not rc.is_capture(stem):
+                rc.transcode(base, stem, spec, sample_seqs=32, level=a.level)
             print(f"extend {spec}", flush=True)
         else:
-            st = rc.transcode(base, stem, spec, calib_seqs=32, level=a.level)
+            st = rc.transcode(base, stem, spec, sample_seqs=32, level=a.level)
             with rc.open(stem) as r:
                 h = r.header
             rec = {"model": a.model, "layers": a.layers, "spec": spec, "spec_template": raw, "n_seq": a.n_seq,

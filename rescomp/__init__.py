@@ -11,7 +11,7 @@ from ._version import __version__
 from .spec import Spec
 from .bf16_wrapper import OutlierChannels, choose_channels
 from .codec import Encoder, Decoder, encode, decode
-from .store import Store, Reader, transcode, is_v2
+from .store import Store, Reader, transcode, is_capture
 from .sink import Sink
 from .hooks import Layers
 from .bindings import ModelBinding, ModuleBinding, bind
@@ -25,4 +25,4 @@ def open(stem, verify=True, bucket=None, prefix=None, s3=None):
 
 
 __all__ = ["Spec", "OutlierChannels", "choose_channels", "Encoder", "Decoder", "encode", "decode", "Store", "Reader", "transcode",
-           "is_v2", "open", "Sink", "Layers", "ModelBinding", "ModuleBinding", "bind", "REGIMES", "resolve_spec", "__version__"]
+           "is_capture", "open", "Sink", "Layers", "ModelBinding", "ModuleBinding", "bind", "REGIMES", "resolve_spec", "__version__"]

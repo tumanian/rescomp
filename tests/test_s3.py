@@ -54,8 +54,8 @@ def test_sink_to_s3_and_read_back(s3, lm):
             assert torch.equal(torch.stack(r.tokens()), toks) and r.annotation("doc")[:3] == [1, 2, 3]
             e = rc.encode(lm.activations(toks[:3], (0, 1, 2)), r.spec, r.channels)[1]
             assert torch.equal(torch.stack(r.read(2, [0, 1, 2])), e[2])
-            assert rc.is_v2("run1", bucket="acts", prefix="team/exp", s3=opts)
-    assert not rc.is_v2("nope", bucket="acts", prefix="team/exp", s3=opts)
+            assert rc.is_capture("run1", bucket="acts", prefix="team/exp", s3=opts)
+    assert not rc.is_capture("nope", bucket="acts", prefix="team/exp", s3=opts)
     with pytest.raises(ValueError):
         rc.open("missing", bucket="acts", prefix="team/exp", s3=opts)
 
@@ -90,7 +90,7 @@ def test_transcode_between_buckets_and_local(s3, lm, tmp_path):
 
 
 def test_bad_stems():
-    from rescomp.storage import location
+    from rescomp.store import location
     with pytest.raises(ValueError):
         location("a/b", bucket="x")
     loc = location("s3://bkt/some/prefix/name", s3={"region": "us-east-1", "endpoint_override": "http://127.0.0.1:1"})

@@ -77,7 +77,7 @@ class StoreSource:
 
 
 class Patcher:
-    """Replace the hooked layers' outputs with reconstructions from `source` (a Reader/Reader2, LiveCodec, or any
+    """Replace the hooked layers' outputs with reconstructions from `source` (a Reader, LiveCodec, or any
     callable (layer, x, seq_ids, starts) -> replacement). Active inside `with patcher:`."""
 
     def __init__(self, layers, source, only: Optional[list] = None):

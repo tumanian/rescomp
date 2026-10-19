@@ -106,7 +106,7 @@ class _CodecState:
         return o
 
     def set_channel_ids(self, i, ids):
-        """First-call calibration: the ids for layer i, already on the device they were measured on."""
+        """First call: the ids for layer i, already on the device they were measured on."""
         self._ids_on[(i, str(ids.device))] = ids
         self.channels.ids[i] = ids.cpu()
 

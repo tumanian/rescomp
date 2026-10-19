@@ -4,7 +4,7 @@
 
 quant     fp32 | bf16 | fp16 | fp8_e4m3 | int8_tok | int{4,8}_g<G> | mxfp4 | nvfp4   (see quant.py)
 layerK    closed-loop layer delta: stored layer i is coded as x_i - xhat_{i-1} unless i % K == 0 (a keyframe)
-out       the n highest-energy channels of each stored layer are kept in bf16 (chosen by calibration)
+out       the n highest-energy channels of each stored layer are kept in bf16 (chosen on the first call, or from a sample; see bf16_wrapper)
 sink      the first s tokens of every sequence are kept in bf16 (attention-sink / BOS rows)
 key       hybrid: a different quantizer for keyframe layers (e.g. key=bf16 keeps keyframes exact)
 

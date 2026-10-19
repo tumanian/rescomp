@@ -31,7 +31,7 @@ def test_lossless_specs_exact(acts):
     assert ((xh - xb.float()).norm() / xb.float().norm()) < 1e-2
 
 
-def test_calibrate_finds_massive_channels(acts):
+def test_choose_channels_finds_massive_channels(acts):
     cal = rc.choose_channels(acts, "int4_g16+out2")
     assert cal.ids.shape == (4, 2)
     assert cal.ids.tolist() == [[5, 17]] * 4
@@ -108,7 +108,7 @@ def test_fp32_codes_are_not_aliased(acts):
     assert torch.equal(rc.decode(streams, spec, cal), xh)
 
 
-def test_calib_ids_validated(acts):
+def test_channel_ids_validated(acts):
     with pytest.raises(ValueError, match="in \\[0, 64"):
         Encoder("bf16+out2", OutlierChannels(torch.tensor([[1, 64]] * 4)), 4).encode_layer(0, acts[0])
     with pytest.raises(ValueError, match="repeat"):
@@ -119,7 +119,7 @@ def test_calib_ids_validated(acts):
         enc.encode_layer(1, acts[1][..., :32])
 
 
-def test_calib_check():
+def test_check_channels():
     spec = rc.Spec.parse("int4_g16+out2")
     with pytest.raises(ValueError):
         Encoder(spec, None, 4)

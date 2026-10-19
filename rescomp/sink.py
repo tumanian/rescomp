@@ -1,4 +1,4 @@
-"""The Sink: hooks on a running model, activations flow into a format-2 store. The model is not wrapped.
+"""The Sink: hooks on a running model, activations flow into a store. The model is not wrapped.
 
     sink = Sink("runs/run1", layers=bind(model, [8, 9, 10, 11]), spec="balanced")   # a regime or a spec string
     with sink:
@@ -37,7 +37,7 @@ class Sink:
                  level=3, site="resid_post", extra=None, model_info=None, fidelity=False, compile=False,
                  bucket=None, prefix=None, s3=None):
         """stem: a local path stem, an s3://bucket/prefix/name URI, or a name with bucket= and prefix= (see
-        rescomp.storage). fidelity=True also measures each layer's reconstruction error in the hook (an extra
+        rescomp.store.location). fidelity=True also measures each layer's reconstruction error in the hook (an extra
         reconstruction and three reductions per layer, in fp32): useful once, costly on every forward.
         compile=True runs the quantizer through torch.compile (fused kernels; a one-time compile per shape class)."""
         if tokens not in (None, "off"):
@@ -61,7 +61,7 @@ class Sink:
         self._pending_ann = {}
         self._open, self._len = [], {}    # open sequence ids and their current lengths
         self._buffer, self._buffered = [], 0     # encoded chunks waiting for zstd + write
-        self._calibrating = False
+        self._choosing = False
         self.t0 = time.time()
 
     @property
@@ -114,8 +114,8 @@ class Sink:
             self._encoder_for(x)
         if "shape" not in call or tuple(x.shape) != call["shape"]:
             return                                     # a layer fired without the first one (or shapes changed): drop the call
-        if self._calibrating:
-            self._calibrate_layer(i, x)
+        if self._choosing:
+            self._choose_channels(i, x)
         st, xhat = self.enc.encode_layer(i, x, reconstruct=self.fidelity)
         if self.fidelity:
             xf = x.float()
@@ -123,8 +123,8 @@ class Sink:
             # fp32 and kept on the device as a 0-d tensor: reducing to Python here would synchronize
             call["err"][l] = torch.stack([e.pow(2).sum(), xf.pow(2).sum(), e.abs().max()])
         call["streams"][l] = st                        # stays on the device until flush
-        if l == self.order[-1] and self._calibrating:
-            self._calibrating = False
+        if l == self.order[-1] and self._choosing:
+            self._choosing = False
             self.store.channels = self.channels
 
     # -- a complete forward call
@@ -187,16 +187,17 @@ class Sink:
                 self.store.set_spec(self.spec)
             if self.channels is None and self.spec.outliers:
                 self.channels = OutlierChannels.placeholder(len(self.order), self.spec.outliers)
-                self._calibrating = True
+                self._choosing = True
             elif self.spec.outliers:
                 check_channels(self.channels, self.spec, len(self.order))
                 self.store.channels = self.channels
             self.enc = Encoder(self.spec, self.channels, len(self.order), compile=self.compile)
         self.enc.reset()
 
-    def _calibrate_layer(self, i, x):
+    def _choose_channels(self, i, x):
+        """First call only: this layer's outlier channels from what is about to be quantized (one sync per layer)."""
         v = x.float() if self.spec.is_key(i) else x.float() - self.enc.prev.to(x.device)
-        self.enc.set_channel_ids(i, choose_layer_channels(v, self.spec.outliers))   # first call only: one sync per layer
+        self.enc.set_channel_ids(i, choose_layer_channels(v, self.spec.outliers))
 
     def _write_buffer(self):
         """The slow part, off the forward path: move the encoded streams to the host, zstd + write each chunk."""

@@ -68,7 +68,7 @@ def test_cli_info_and_eval(tiny_model, fake_tok, tmp_path, monkeypatch, capsys):
         tiny_model(toks[4:])
     main(["info", stem])
     out = capsys.readouterr().out
-    assert "RSC2" in out and "layers [1, 3]" in out
+    assert "RSC3" in out and "layers [1, 3]" in out
     monkeypatch.setattr("rescomp.hf.load_model", lambda *a, **k: (tiny_model, fake_tok))
     main(["eval", stem, "--batch", "4", "--live", "--coherence", "--n-prompts", "1", "--n-new", "4", "--seeds", "2",
           "--out", str(tmp_path / "e.json")])
