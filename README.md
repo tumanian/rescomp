@@ -96,7 +96,7 @@ token (`transform="mean+last"`, the default; also `"mean"` or `"last"`). Same ho
 and S3 as the `Sink`.
 
 ```python
-sink = rc.TransformSink("runs/probe", layers=rc.bind(model, [20, 28], tokenizer=tok))   # codec "exact" by default
+sink = rc.TransformSink("runs/probe", layers=rc.bind(model, [20, 28], tokenizer=tok))   # codec "fp32" by default
 with sink, torch.no_grad():
     for batch in loader:
         sink.annotate(label=batch["label"])
@@ -110,14 +110,14 @@ y = r.annotation("label")
   layer until `chunk_seqs` (4096) sequences are in, then go through the codec and into the store as one chunk.
   The site becomes `resid_post.mean+last`; `r.pooled_rows` names the rows, `r.read(28)` gives the `[2, d]` rows
   of each sequence.
-- The default codec `"exact"` is an fp16 cast: the last token of a bf16 model is stored bit for bit, a mean is
-  rounded to fp16 (relative error about 5e-4). `codec="fp32"` keeps the means exactly too; the lossy regimes work
-  as well (outlier channels are chosen on the first chunk).
+- The default codec is `"fp32"`: the rows are stored bit for bit (a mean is an fp32 value, so the `"exact"`
+  regime, an fp16 cast, would round it to about 5e-4 relative; it still stores the last token of a bf16 model bit
+  for bit and takes 1.5x less space). The lossy regimes work as well (outlier channels are chosen on the first chunk).
 - A KV-cache continuation call (a generation step) is skipped: the rows and the stored tokens describe the prompt.
 - Cost (A10G, `scripts/pooling_overhead.py`): Qwen3-8B with 12 hooked layers runs 0.7% slower, GPT-2 small 18%
   (a fixed 0.4-1.6 ms per hooked layer); memory is the accumulated rows only (k x d x 4 bytes per sequence per
-  layer). Stored: 13 KB per sequence per layer on Qwen3-8B with `exact`, 211x less than an `exact` full capture
-  and 61x less than `compact`. DESIGN.md has the table.
+  layer). Stored: 20 KB per sequence per layer on Qwen3-8B (13 KB with `exact`), 141x less than an `exact` full
+  capture and 41x less than `compact`. DESIGN.md has the table.
 - `r.pooled(layer, "mean")` also works on a full capture from a `Sink`: the row is computed from the stored
   tokens with the attention mask, so a probe reads either kind of capture the same way.
 

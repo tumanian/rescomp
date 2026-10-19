@@ -9,8 +9,8 @@ to the input text, (2) the attention masks match, (3) the stored activations are
 generated tokens in order, (5) re-encoding the hooked activations on the CPU gives the same bytes as the GPU
 encode for the exact regime and the keyframes (delta layers and nvfp4 may differ in the last bits).
 Then the TransformSink (--pooled, on by default): (6) the stored "last" rows are the last real token of the
-hooked activations bit for bit and the "mean" rows the masked mean within fp32 rounding (fp32 codec), the
-default "exact" codec rounds both to fp16, (7) Reader.pooled on a full capture gives the same rows, (8) a
+hooked activations bit for bit and the "mean" rows the masked mean within fp32 rounding (fp32, the default
+codec), the "exact" regime rounds both to fp16, (7) Reader.pooled on a full capture gives the same rows, (8) a
 generate() run pools the prompt once and skips the cached steps.
 """
 import argparse

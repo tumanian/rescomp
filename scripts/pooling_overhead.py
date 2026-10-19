@@ -36,7 +36,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--layers", type=int, nargs="+", required=True)
-    ap.add_argument("--codecs", nargs="*", default=["exact", "fp32"])
+    ap.add_argument("--codecs", nargs="*", default=["fp32", "exact"])
     ap.add_argument("--transform", default="mean+last")
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--seq-len", type=int, default=256)

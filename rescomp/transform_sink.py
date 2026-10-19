@@ -9,9 +9,8 @@ every token, for probes. Same hooks, tokens, annotations, store, flush and S3 as
 
 Per hooked layer the transform turns the activation [B, T, d] into [B, k, d] fp32 on the device (k = 2 for
 "mean+last"); the rows accumulate per layer until `chunk_seqs` sequences are in, then go through the codec's
-encoder and into the store as one chunk of shape [N, k, d] per layer. The default codec is "exact" (an fp16
-cast): the last token of a bf16 model is stored bit for bit, a mean is rounded to fp16; codec="fp32" keeps the
-means exactly too. The site becomes "<site>.<transform name>" and the header's extra records the row names
+encoder and into the store as one chunk of shape [N, k, d] per layer. The default codec is "fp32": the rows are
+stored bit for bit (a mean is an fp32 value; the "exact" regime, an fp16 cast, would round it). The site becomes "<site>.<transform name>" and the header's extra records the row names
 (`extra["pooled"] = {"name": ..., "rows": [...]}`), which `Reader.pooled` uses.
 
 A KV-cache continuation call (a generation step) is skipped: the rows describe the prompt the model was given,
@@ -26,7 +25,7 @@ from .transforms import transform as as_transform
 
 
 class TransformSink(Sink):
-    def __init__(self, stem, layers, codec="exact", *, transform="mean+last", chunk_seqs=4096, site="resid_post",
+    def __init__(self, stem, layers, codec="fp32", *, transform="mean+last", chunk_seqs=4096, site="resid_post",
                  extra=None, **kw):
         self.transform = as_transform(transform)
         self.chunk_seqs = int(chunk_seqs)

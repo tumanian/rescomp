@@ -62,7 +62,7 @@ def test_pooled_rows_are_the_masked_mean_and_last(lm, tmp_path):
     stem = str(tmp_path / "pool")
     toks = torch.randint(0, V, (5, 9), generator=torch.Generator().manual_seed(0))
     mask = random_mask(5, 9, 1)
-    with rc.TransformSink(stem, layers_of(lm), "fp32") as sink:
+    with rc.TransformSink(stem, layers_of(lm)) as sink:                   # the default codec, fp32
         sink.annotate(doc=[10, 11, 12, 13, 14], split="train")
         lm(toks, attention_mask=mask)
         st = sink.stats()
@@ -84,16 +84,19 @@ def test_pooled_rows_are_the_masked_mean_and_last(lm, tmp_path):
         assert "pooled rows per sequence" in r.summary()
 
 
-def test_exact_codec_rounds_to_fp16(lm, tmp_path):
-    """The default codec is "exact" (fp16): last-token rows of a bf16 model are stored bit for bit, means are
-    rounded to fp16."""
-    stem = str(tmp_path / "exact")
+def test_default_codec_is_fp32_and_exact_rounds_to_fp16(lm, tmp_path):
+    """The default codec is fp32 (rows bit for bit); the "exact" regime (fp16) rounds the rows."""
     toks = torch.randint(0, V, (3, 6))
-    with rc.TransformSink(stem, layers_of(lm)) as sink:
-        assert sink.codec.given == "exact"
+    with rc.TransformSink(str(tmp_path / "default"), layers_of(lm)) as sink:
+        assert sink.codec.given == "fp32"
+        lm(toks)
+    with rc.TransformSink(str(tmp_path / "exact"), layers_of(lm), "exact") as sink:
         lm(toks)
     ref = lm.activations(toks, (0, 1, 2))
-    with rc.open(stem) as r:
+    with rc.open(str(tmp_path / "default")) as r:
+        assert r.spec.name == "fp32"
+        assert torch.equal(r.pooled(2, "last"), ref[2][:, -1]) and torch.equal(r.pooled(2, "mean"), ref[2].mean(1))
+    with rc.open(str(tmp_path / "exact")) as r:
         assert r.spec.name == "fp16"
         assert torch.equal(r.pooled(2, "last"), ref[2][:, -1].half().float())
         assert torch.equal(r.pooled(2, "mean"), ref[2].mean(1).half().float())

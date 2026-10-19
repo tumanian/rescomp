@@ -70,21 +70,22 @@ or at flush/close, the accumulated rows go through the normal codec encoder and 
 `[N, k, d]` per layer; the format is untouched (a chunk with T = k). The site becomes `<site>.<transform name>`
 and `extra["pooled"] = {"name", "rows"}` records the row names. `Reader.pooled(layer, which)` returns `[N, d]` in
 sequence order from the stored row, or computes it from `read()` and the mask on a full capture. Storage is
-"exact" by default (fp16: the last token of a bf16 model bit for bit, the mean rounded to fp16; `fp32` for exact
-means). A lossy codec that keeps outlier channels chooses them on the first chunk's rows, not per hook.
+`fp32` by default (the user's call, 2026-10-19, after the first measurements: a mean is an fp32 value and the
+"exact" regime, an fp16 cast, would round it; the rows are 100-300x smaller than a full capture anyway, so the
+1.5x that fp16 saves does not matter). A lossy codec that keeps outlier channels chooses them on the first chunk's rows, not per hook.
 
 Measured on the A10G (`scripts/pooling_overhead.py`, 2026-10-19: median forward time clean and with the
 TransformSink attached, rows accumulating on the device, nothing written during the timed passes; the batches
 are right-padded to 55-100% real tokens):
 
-| Model, batch | forward | with TransformSink | per hooked layer | peak GPU memory added | stored per sequence per layer (`exact` / `fp32`) | vs a full capture |
+| Model, batch | forward | with TransformSink | per hooked layer | peak GPU memory added | stored per sequence per layer (`fp32` / `exact`) | vs a full capture |
 |---|---|---|---|---|---|---|
-| GPT-2, 16 x 256, layers 8-11 | 36.3 ms | +17.6% | 1.6 ms | +9 MiB (the 368 sequences' rows, nothing else) | 2.5 KB / 3.7 KB | 105x smaller than `exact`, 34x than `compact` |
-| Qwen3-8B, 4 x 512, layers 24-35 | 628 ms | +0.7% | 0.36 ms | +34 MiB (the 92 sequences' rows) | 13 KB / 20 KB | 211x smaller than `exact`, 61x than `compact` |
+| GPT-2, 16 x 256, layers 8-11 | 36.3 ms | +17.6% | 1.6 ms | +9 MiB (the 368 sequences' rows, nothing else) | 3.7 KB / 2.5 KB | 70x smaller than `exact`, 23x than `compact` (105x / 34x with `exact` rows) |
+| Qwen3-8B, 4 x 512, layers 24-35 | 628 ms | +0.7% | 0.36 ms | +34 MiB (the 92 sequences' rows) | 20 KB / 13 KB | 141x smaller than `exact`, 41x than `compact` (211x / 61x with `exact` rows) |
 
-The pooled rows cost 1.24x less than their raw bf16 size with `exact` (fp16 + zstd) and 0.83x with `fp32`
-(fp32 rows do not compress); against the raw bf16 activations of the same sequences they are 160-320x smaller
-(T / k times the codec's ratio). Memory is only the accumulator, k x d x 4 bytes per sequence per layer (32 KB
+The pooled rows cost 0.83x of their raw bf16 size with `fp32` (fp32 rows do not compress) and 1.24x less with
+`exact` (fp16 + zstd); against the raw bf16 activations of the same sequences they are 100-320x smaller (T / k
+times the codec's ratio). Memory is only the accumulator, k x d x 4 bytes per sequence per layer (32 KB
 on Qwen3-8B for two rows), so `chunk_seqs` = 4096 holds about 1.5 GiB for 12 layers; flush takes 0.1-0.2 s.
 The compute overhead is a fixed cost per hooked layer (the mask multiply, a sum, a gather: a few small kernels and
 the Python around them), which the GPU hides on an 8B model and does not on GPT-2, whose forward is launch-bound:
