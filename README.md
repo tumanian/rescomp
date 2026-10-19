@@ -114,6 +114,10 @@ y = r.annotation("label")
   rounded to fp16 (relative error about 5e-4). `codec="fp32"` keeps the means exactly too; the lossy regimes work
   as well (outlier channels are chosen on the first chunk).
 - A KV-cache continuation call (a generation step) is skipped: the rows and the stored tokens describe the prompt.
+- Cost (A10G, `scripts/pooling_overhead.py`): Qwen3-8B with 12 hooked layers runs 0.7% slower, GPT-2 small 18%
+  (a fixed 0.4-1.6 ms per hooked layer); memory is the accumulated rows only (k x d x 4 bytes per sequence per
+  layer). Stored: 13 KB per sequence per layer on Qwen3-8B with `exact`, 211x less than an `exact` full capture
+  and 61x less than `compact`. DESIGN.md has the table.
 - `r.pooled(layer, "mean")` also works on a full capture from a `Sink`: the row is computed from the stored
   tokens with the attention mask, so a probe reads either kind of capture the same way.
 
