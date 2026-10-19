@@ -52,10 +52,10 @@ def test_store_backed_patcher_matches_live(lm, toks, tmp_path):
     r = rc.open(stem)
     run = run_of(lm)
     # stored reconstructions were made from clean inputs, so patching every layer from the file only changes the
-    # logits through the last one: it equals a live patch of that layer alone (a keyframe, same spec and calib)
+    # logits through the last one: it equals a live patch of that layer alone (a keyframe, same spec and channels)
     from_file = I.kl_ppl(run, toks, I.Patcher(layers_of(lm), r), seq_ids=list(range(8)), batch=4)
-    last_only = I.kl_ppl(run, toks, I.Patcher(layers_of(lm), I.LiveCodec(spec, r.calib), only=[2]), batch=4)
-    live_all = I.kl_ppl(run, toks, I.Patcher(layers_of(lm), I.LiveCodec(spec, r.calib)), batch=4)
+    last_only = I.kl_ppl(run, toks, I.Patcher(layers_of(lm), I.LiveCodec(spec, r.channels), only=[2]), batch=4)
+    live_all = I.kl_ppl(run, toks, I.Patcher(layers_of(lm), I.LiveCodec(spec, r.channels)), batch=4)
     assert abs(from_file["kl_mean"] - last_only["kl_mean"]) < 1e-6 and from_file["kl_mean"] > 0
     assert live_all["kl_mean"] > from_file["kl_mean"]                   # errors compound in the live chain
     # a token window of a stored sequence

@@ -52,7 +52,7 @@ def test_sink_to_s3_and_read_back(s3, lm):
         with opener() as r:
             assert r.stem == "s3://acts/team/exp/run1" and r.n_seq == 6 and r.header["location"] == r.stem
             assert torch.equal(torch.stack(r.tokens()), toks) and r.annotation("doc")[:3] == [1, 2, 3]
-            e = rc.encode(lm.activations(toks[:3], (0, 1, 2)), r.spec, r.calib)[1]
+            e = rc.encode(lm.activations(toks[:3], (0, 1, 2)), r.spec, r.channels)[1]
             assert torch.equal(torch.stack(r.read(2, [0, 1, 2])), e[2])
             assert rc.is_v2("run1", bucket="acts", prefix="team/exp", s3=opts)
     assert not rc.is_v2("nope", bucket="acts", prefix="team/exp", s3=opts)

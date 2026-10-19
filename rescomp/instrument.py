@@ -4,7 +4,7 @@ Separate from the production flow (`rescomp.sink`). Same module-object conventio
 of a `Layers` and replaces their outputs; the model is otherwise run by the caller.
 
     patcher = Patcher(layers, source=rc.open("runs/run1"))              # reconstructions read from a store
-    patcher = Patcher(layers, source=LiveCodec("int4_g384+layerK4+out12", calib))   # encode-decode on the fly
+    patcher = Patcher(layers, source=LiveCodec("int4_g384+layerK4+out12", channels))   # encode-decode on the fly
     with patcher.sequences([0, 1]):                                     # which stored sequences this batch is
         logits = model(**batch)
 
@@ -19,7 +19,8 @@ from typing import Dict, Optional
 import torch
 import torch.nn.functional as F
 
-from .codec import Calib, Encoder
+from .bf16_wrapper import OutlierChannels
+from .codec import Encoder
 from .sink import Layers, _first
 from .spec import Spec
 
@@ -27,19 +28,19 @@ from .spec import Spec
 class LiveCodec:
     """Source for a Patcher: encode each hooked layer against the previous patched one, return its reconstruction."""
 
-    def __init__(self, spec, calib=None):
-        self.spec, self.calib = Spec.parse(spec), calib
+    def __init__(self, spec, channels=None):
+        self.spec, self.channels = Spec.parse(spec), channels
         self.enc = None
 
     def bind(self, order, all_layers=None):
         """order: the layers actually patched (a subset re-indexes keyframes: each patched run starts with one).
-        A calibration made for `all_layers` is cut down to the rows of `order`."""
+        Outlier channels chosen for `all_layers` are cut down to the rows of `order`."""
         self.order = list(order)
-        calib = self.calib
-        o = None if calib is None else calib.outliers
+        ch = self.channels
+        o = None if ch is None else ch.ids
         if o is not None and all_layers and len(o) == len(all_layers) and len(self.order) != len(all_layers):
-            calib = Calib(o[[list(all_layers).index(l) for l in self.order]], calib.source)
-        self.enc = Encoder(self.spec, calib, len(self.order))
+            ch = OutlierChannels(o[[list(all_layers).index(l) for l in self.order]], ch.source)
+        self.enc = Encoder(self.spec, ch, len(self.order))
 
     def __call__(self, layer, x, seq_ids, starts):
         i = self.order.index(layer)

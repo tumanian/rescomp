@@ -50,7 +50,7 @@ def cmd_eval(a):
     from .hf import hf_layers, load_model
     from .store import Reader
     with Reader(a.stem) as r:
-        header, layers, spec, calib = r.header, r.layers, r.spec, r.calib
+        header, layers, spec, channels = r.header, r.layers, r.spec, r.channels
         n = min(a.n_seq or r.n_seq, r.n_seq)
         toks = r.tokens(slice(0, n))
         if any(t is None for t in toks) or len({len(t) for t in toks}) != 1:
@@ -65,9 +65,9 @@ def cmd_eval(a):
     with Reader(a.stem) as r:
         out["last_layer"] = I.kl_ppl(run, tokens, I.Patcher(L, r, only=[layers[-1]]), seq_ids=list(range(n)), batch=a.batch)
     if a.live:
-        out["live"] = I.kl_ppl(run, tokens, I.Patcher(L, I.LiveCodec(spec, calib)), batch=a.batch)
+        out["live"] = I.kl_ppl(run, tokens, I.Patcher(L, I.LiveCodec(spec, channels)), batch=a.batch)
     if a.coherence:
-        out["coherence"] = I.coherence(run, PROMPTS[: a.n_prompts], I.Patcher(L, I.LiveCodec(spec, calib)),
+        out["coherence"] = I.coherence(run, PROMPTS[: a.n_prompts], I.Patcher(L, I.LiveCodec(spec, channels)),
                                        tokenizer=tok, n_new=a.n_new, seeds=a.seeds, device=dev)["summary"]
     print(json.dumps(out, indent=1))
     if a.out:

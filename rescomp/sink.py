@@ -27,7 +27,8 @@ from typing import Callable, Dict, Optional
 
 import torch
 
-from .codec import Calib, Encoder
+from .bf16_wrapper import OutlierChannels, check_channels, choose_layer_channels
+from .codec import Encoder
 from .regimes import is_regime, needs_width, resolve
 from .spec import Spec
 from .store import Store
@@ -68,7 +69,7 @@ def _first(o):
 
 
 class Sink:
-    def __init__(self, stem, layers, spec, *, tokens=None, calib=None, buffer_bytes=1 << 30, rotate_bytes=None,
+    def __init__(self, stem, layers, spec, *, tokens=None, channels=None, buffer_bytes=1 << 30, rotate_bytes=None,
                  level=3, site="resid_post", extra=None, model_info=None, fidelity=False, compile=False,
                  bucket=None, prefix=None, s3=None):
         """stem: a local path stem, an s3://bucket/prefix/name URI, or a name with bucket= and prefix= (see
@@ -86,12 +87,12 @@ class Sink:
             raise ValueError("no layers to hook")
         self.record_tokens = tokens is None
         self.fidelity, self.compile = fidelity, compile
-        self.calib = calib
+        self.channels = channels
         self.buffer_bytes, self.site = buffer_bytes, site
         info = dict(L.model_info)
         info.update(model_info or {})
         info.setdefault("n_layers", L.n_layers)
-        self.store = Store(stem, model=info, layers=self.order, spec=self.spec, calib=calib, site=site, level=level,
+        self.store = Store(stem, model=info, layers=self.order, spec=self.spec, channels=channels, site=site, level=level,
                            hook_names=L.hook_names, extra=dict(extra or {}), rotate_bytes=rotate_bytes,
                            bucket=bucket, prefix=prefix, s3=s3)
         self.store.regime = spec if is_regime(spec) else None
@@ -194,7 +195,7 @@ class Sink:
         if l == self.order[-1]:
             if self._calibrating:
                 self._calibrating = False
-                self.store.calib = self.calib
+                self.store.channels = self.channels
             self._complete_call(x.device)
 
     # -- a complete forward call
@@ -249,29 +250,25 @@ class Sink:
 
     # -- encoding (in the hook, on the model's device)
     def _encoder_for(self, x0):
-        """Resolve the spec on the first call's first layer and reset the encoder per call. Without a given
-        calibration, the first call calibrates each layer's outlier channels in that layer's own hook, from what
-        the encoder is about to quantize (x at keyframes, x - xhat_prev at delta layers)."""
+        """Resolve the spec on the first call's first layer and reset the encoder per call. Without given
+        outlier channels, the first call chooses each layer's in that layer's own hook, from what the encoder is
+        about to quantize (x at keyframes, x - xhat_prev at delta layers); see bf16_wrapper."""
         if self.enc is None:
             if self.spec is None:
                 self.spec = resolve(self._spec_arg, x0.shape[-1])
                 self.store.set_spec(self.spec)
-            if self.calib is None and self.spec.outliers:
-                n, L = self.spec.outliers, len(self.order)
-                self.calib = Calib(torch.arange(n).repeat(L, 1), source="first_call")   # placeholder rows, filled per layer
+            if self.channels is None and self.spec.outliers:
+                self.channels = OutlierChannels.placeholder(len(self.order), self.spec.outliers)
                 self._calibrating = True
             elif self.spec.outliers:
-                self.calib.check(self.spec, len(self.order))
-                self.store.calib = self.calib
-            self.enc = Encoder(self.spec, self.calib, len(self.order), compile=self.compile)
+                check_channels(self.channels, self.spec, len(self.order))
+                self.store.channels = self.channels
+            self.enc = Encoder(self.spec, self.channels, len(self.order), compile=self.compile)
         self.enc.reset()
 
     def _calibrate_layer(self, i, x):
         v = x.float() if self.spec.is_key(i) else x.float() - self.enc.prev.to(x.device)
-        energy = v.pow(2).sum(tuple(range(v.dim() - 1)))
-        ids = energy.topk(self.spec.outliers).indices.sort().values
-        self.enc._outl_cache[(i, str(x.device))] = ids          # the encoder uses this row from now on
-        self.calib.outliers[i] = ids.cpu()                      # first call only: one sync per layer
+        self.enc.set_channel_ids(i, choose_layer_channels(v, self.spec.outliers))   # first call only: one sync per layer
 
     def _write_buffer(self):
         """The slow part, off the forward path: move the encoded streams to the host, zstd + write each chunk."""

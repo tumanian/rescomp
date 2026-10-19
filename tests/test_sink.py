@@ -43,15 +43,15 @@ def test_forward_calls_become_chunks(lm, tmp_path):
         for i, l in enumerate((0, 1, 2)):
             got = torch.stack(r.read(l))
             # chunk-wise encoding of exactly these activations, calibrated on the first chunk
-            cal = r.calib
+            cal = r.channels
             exp = torch.cat([rc.encode(ref[:, :4], spec, cal)[1][i], rc.encode(ref[:, 4:], spec, cal)[1][i]], 0)
             assert torch.equal(got, exp)
-        assert r.header["calib"]["source"] == "first_call"
+        assert r.header["outlier_channels"]["source"] == "first_call"
         # each layer's outlier channels came from its own activations on the first call (keyframes exactly as the
         # offline calibration; delta layers use the closed-loop delta, which can differ by a channel)
-        off = rc.calibrate(ref[:, :4], spec).outliers.tolist()
-        assert r.calib.outliers[0].tolist() == off[0] and r.calib.outliers[2].tolist() == off[2]
-        assert len(set(r.calib.outliers[1].tolist())) == 2
+        off = rc.choose_channels(ref[:, :4], spec).ids.tolist()
+        assert r.channels.ids[0].tolist() == off[0] and r.channels.ids[2].tolist() == off[2]
+        assert len(set(r.channels.ids[1].tolist())) == 2
 
 
 def test_generation_style_calls_are_one_sequence(lm, tmp_path):

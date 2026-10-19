@@ -26,9 +26,9 @@ def write_store(stem, spec="int4_g16+layerK2+out2", rotate_bytes=4 << 30, chunks
     acts = make_acts(L=4, B=N, T=8, d=64, seed=3)
     tokens = torch.randint(0, 50000, (N, 8))
     spec = rc.Spec.parse(spec)
-    cal = rc.calibrate(acts[:, :4], spec)
+    cal = rc.choose_channels(acts[:, :4], spec)
     expect = []
-    with S.Store(stem, model=MODEL, layers=LAYERS, spec=spec, calib=cal, rotate_bytes=rotate_bytes,
+    with S.Store(stem, model=MODEL, layers=LAYERS, spec=spec, channels=cal, rotate_bytes=rotate_bytes,
                  hook_names={8: {"hf": "transformer.h.8"}}, extra={"note": "x"}) as st:
         for a, n in chunks:
             X = acts[:, a: a + n]
@@ -195,9 +195,9 @@ def test_transcode(tmp_path):
     with rc.open(dst) as r:
         assert r.spec == spec and r.header["extra"]["source_spec"] == "fp32" and r.n_seq == 10
         assert torch.equal(torch.stack(r.tokens()), tokens) and r.annotation("doc_id") == [10 * i for i in range(10)]
-        assert r.header["calib"]["source"].startswith("first ")
+        assert r.header["outlier_channels"]["source"].startswith("first ")
         for a, n in ((0, 3), (3, 5), (8, 2)):              # chunk-wise re-encoding with the file's own calibration
-            exp = rc.encode(acts[:, a: a + n], spec, r.calib)[1]
+            exp = rc.encode(acts[:, a: a + n], spec, r.channels)[1]
             assert torch.equal(torch.stack(r.read(9, list(range(a, a + n)))), exp[1])
     rc.transcode(src, str(tmp_path / "x"), "compact")
     assert rc.open(str(tmp_path / "x")).spec.name == "int4_g8+layerK4+out8"

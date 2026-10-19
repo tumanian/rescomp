@@ -1,7 +1,7 @@
 """Storage, format version 2: tensors apart from metadata, on the local disk or in S3 (see rescomp.storage).
 
     <stem>.00000.rsc, <stem>.00001.rsc, ...   append-only files of compressed tensor blobs, rotated at a size limit
-    <stem>.meta.parquet                        one row: model, spec, calibration, stored layers, fidelity, byte counts
+    <stem>.meta.parquet                        one row: model, spec, outlier channels, stored layers, fidelity, byte counts
     <stem>.chunks.parquet                      one row per chunk: which sequences it holds and at which positions
     <stem>.blobs.parquet                       one row per blob: chunk, layer, stream, file, byte range, crc, dtype, shape
     <stem>.tokens.parquet                      one row per sequence: token ids, attention mask, annotations as columns
@@ -27,7 +27,8 @@ import torch
 
 from . import lossless as LL
 from ._version import __version__
-from .codec import Calib, Decoder, Encoder, calibrate
+from .bf16_wrapper import OutlierChannels, check_channels, choose_channels
+from .codec import Decoder, Encoder
 from .quant import CODEC_VERSION
 from .spec import Spec
 from .storage import Location, location
@@ -130,7 +131,7 @@ def _from_arrow(value):
 class Store:
     """Format-2 writer. Give it encoded chunks and per-sequence tokens; call flush() to make the files readable."""
 
-    def __init__(self, stem, *, model, layers, spec=None, calib=None, site="resid_post", level=3, shuffle=True,
+    def __init__(self, stem, *, model, layers, spec=None, channels=None, site="resid_post", level=3, shuffle=True,
                  hook_names=None, extra=None, rotate_bytes=None, bucket=None, prefix=None, s3=None):
         """stem: a local path stem, an s3://bucket/prefix/name URI, or a name with bucket= and prefix=.
         spec may be None at construction (a regime that needs the model width) and set with set_spec()
@@ -141,7 +142,7 @@ class Store:
         self.layers = [int(l) for l in layers]
         if not self.layers or self.layers != sorted(set(self.layers)):
             raise ValueError("layers must be a non-empty, strictly increasing list")
-        self.calib = calib
+        self.channels = channels
         self.chunk_rows, self.blob_rows = [], []
         if self.spec is not None:
             self.set_spec(self.spec)
@@ -168,9 +169,9 @@ class Store:
             raise ValueError("spec cannot change after the first chunk")
         self.spec = Spec.parse(spec)
         if not self.spec.outliers:
-            self.calib = None
-        elif self.calib is not None:
-            self.calib.check(self.spec, len(self.layers))
+            self.channels = None
+        elif self.channels is not None:
+            check_channels(self.channels, self.spec, len(self.layers))
 
     # -- sequences
     def new_sequence(self, tokens=None, mask=None, **annotations):
@@ -228,7 +229,7 @@ class Store:
         spec = self.spec or Spec("bf16")
         layers = [{"index": i, "layer": l, "site": f"{self.site}.{l}", "quant": spec.quant_for(i),
                    "keyframe": spec.is_key(i),
-                   "outlier_channels": self.calib.outliers[i].tolist() if self.calib is not None else None,
+                   "outlier_channels": self.channels.ids[i].tolist() if self.channels is not None else None,
                    "hook": self.hook_names.get(str(l)),
                    "fidelity": {"rel_l2": float(np.sqrt(self.sse[i] / self.ss[i])) if self.ss[i] > 0 else None,
                                 "max_abs": float(self.maxabs[i]) if self.n_measured else None}} for i, l in enumerate(self.layers)]
@@ -237,7 +238,7 @@ class Store:
         return {"format": MAGIC2.decode(), "version": VERSION2, "codec": CODEC_VERSION, "library": f"rescomp {__version__}",
                 "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "model": json.dumps(self.model),
                 "spec": self.spec.name if self.spec else None, "regime": self.regime,
-                "calib": json.dumps((self.calib or Calib(None, "none")).to_dict()),
+                "outlier_channels": json.dumps((self.channels or OutlierChannels(None, "none")).to_dict()),
                 "lossless": json.dumps({"codec": "zstd", "level": self.level, "shuffle": self.shuffle}),
                 "site": self.site, "d_model": self.d, "layers": json.dumps(layers),
                 "fidelity": json.dumps({"rel_l2": float(np.sqrt(self.sse.sum() / total)) if total > 0 else None,
@@ -318,7 +319,7 @@ class Reader:
         fs = self.loc.fs
         m = pq.read_table(table_path(self.loc, "meta"), filesystem=fs).to_pylist()[0]
         self.meta = m
-        self.header = dict(m, model=json.loads(m["model"]), calib=json.loads(m["calib"]), lossless=json.loads(m["lossless"]),
+        self.header = dict(m, model=json.loads(m["model"]), outlier_channels=json.loads(m["outlier_channels"]), lossless=json.loads(m["lossless"]),
                            layers=json.loads(m["layers"]), fidelity=json.loads(m["fidelity"]), extra=json.loads(m["extra"]),
                            bytes=json.loads(m["bytes"]))
         if m["version"] > VERSION2:
@@ -327,7 +328,7 @@ class Reader:
             raise ValueError(f"{self.stem}: codec version {m.get('codec', 1)}; this library decodes {CODEC_VERSION}")
         self.spec = Spec.parse(m["spec"])
         self.regime = m.get("regime")
-        self.calib = Calib.from_dict(self.header["calib"])
+        self.channels = OutlierChannels.from_dict(self.header["outlier_channels"])
         self.layers = [l["layer"] for l in self.header["layers"]]
         self.d = m["d_model"]
         self.shuffle = self.header["lossless"]["shuffle"]
@@ -387,7 +388,7 @@ class Reader:
             xs = [None] * len(self.layers)
         if xs[upto] is not None:
             return xs
-        dec = Decoder(self.spec, self.calib, len(self.layers))
+        dec = Decoder(self.spec, self.channels, len(self.layers))
         first = upto - (upto % self.spec.K) if self.spec.K else upto
         have = [i for i in range(first, upto) if xs[i] is not None]
         if have:
@@ -482,9 +483,9 @@ def transcode(src, dst, spec, calib_seqs=32, level=3, rotate_bytes=None, extra=N
     from .regimes import resolve
     with Reader(src, **(src_loc or {})) as r:
         spec = resolve(spec, r.d)
-        calib = None
+        channels = None
         if spec.outliers:
-            # calibrate on the chunks that hold the first calib_seqs sequences (chunks are rectangular)
+            # choose the outlier channels on the chunks that hold the first calib_seqs sequences (chunks are rectangular)
             chunks, seen = [], set()
             for c in r.chunks:
                 if len(seen) >= calib_seqs:
@@ -492,18 +493,18 @@ def transcode(src, dst, spec, calib_seqs=32, level=3, rotate_bytes=None, extra=N
                 chunks.append(c["chunk"])
                 seen.update(c["seq_ids"])
             sample = [torch.cat([r._decode_chunk(ci, i)[i].flatten(0, 1) for ci in chunks]) for i in range(len(r.layers))]
-            calib = calibrate(torch.stack(sample).unsqueeze(1), spec, source=f"first {len(seen)} sequences of {os.path.basename(r.stem)}")
+            channels = choose_channels(torch.stack(sample).unsqueeze(1), spec, source=f"first {len(seen)} sequences of {os.path.basename(r.stem)}")
         ex = dict(r.header["extra"])
         ex.update({"transcoded_from": r.stem, "source_spec": r.spec.name,
                    "source_rel_l2": r.header["fidelity"]["rel_l2"]}, **(extra or {}))
         hooks = {l["layer"]: l["hook"] for l in r.header["layers"] if l.get("hook")}
-        with Store(dst, model=r.header["model"], layers=r.layers, spec=spec, calib=calib, site=r.header["site"],
+        with Store(dst, model=r.header["model"], layers=r.layers, spec=spec, channels=channels, site=r.header["site"],
                    level=level, hook_names=hooks, extra=ex, rotate_bytes=rotate_bytes, **(dst_loc or {})) as st:
             for row in r.tokens_table.to_pylist():
                 sid = row["seq_id"]
                 new = st.new_sequence(row["tokens"], row["mask"], **{k: row[k] for k in r.annotations})
                 assert new == sid
-            enc = Encoder(spec, calib, len(r.layers))
+            enc = Encoder(spec, channels, len(r.layers))
             for c in r.chunks:
                 ci = c["chunk"]
                 acts = [r._decode_chunk(ci, i)[i] for i in range(len(r.layers))]

@@ -84,17 +84,17 @@ def test_pipeline_without_transformers(toy, tmp_path, no_transformers):
         assert r.header["model"]["id"] == "toy-lm" and r.header["layers"][1]["hook"] == {"toy": "blocks.1"}
         assert r.n_seq == 10 and r.annotation("doc")[:4] == [0, 1, 2, 3] and r.header["fidelity"]["rel_l2"] > 0
         X = toy.activations(toks[:4], (0, 1, 2))
-        assert torch.equal(torch.stack(r.read(2, [0, 1, 2, 3])), rc.encode(X, r.spec, r.calib)[1][2])
-        spec, calib = r.spec, r.calib
+        assert torch.equal(torch.stack(r.read(2, [0, 1, 2, 3])), rc.encode(X, r.spec, r.channels)[1][2])
+        spec, channels = r.spec, r.channels
     run = lambda t: toy(t)
     assert I.kl_ppl(run, toks, I.Patcher(toy_layers(toy), lambda l, x, s, st: x), batch=4)["kl_mean"] == 0.0
     with rc.open(stem) as r:
         f = I.kl_ppl(run, toks, I.Patcher(toy_layers(toy), r, only=[2]), seq_ids=list(range(10)), batch=4)
     assert 0 < f["kl_mean"] < 1
-    lv = I.kl_ppl(run, toks, I.Patcher(toy_layers(toy), I.LiveCodec(spec, calib)), batch=4)
+    lv = I.kl_ppl(run, toks, I.Patcher(toy_layers(toy), I.LiveCodec(spec, channels)), batch=4)
     assert 0 < lv["kl_mean"] < 1
-    per = I.per_layer(run, toks, toy_layers(toy), I.LiveCodec(spec, calib), batch=4)
+    per = I.per_layer(run, toks, toy_layers(toy), I.LiveCodec(spec, channels), batch=4)
     assert list(per) == [0, 1, 2]
-    co = I.coherence(run, [[1, 2, 3], [4, 5]], I.Patcher(toy_layers(toy), I.LiveCodec(spec, calib)), n_new=5, seeds=2)["summary"]
+    co = I.coherence(run, [[1, 2, 3], [4, 5]], I.Patcher(toy_layers(toy), I.LiveCodec(spec, channels)), n_new=5, seeds=2)["summary"]
     assert co["n_pairs"] == 4 and abs(co["ppl_ratio"] - math.exp(co["log_ppl_diff"])) < 1e-9
     assert "transformers" not in sys.modules

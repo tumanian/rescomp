@@ -39,7 +39,7 @@ def golden_acts():
 
 def digest(name, acts):
     spec = rc.Spec.parse(name)
-    cal = rc.calibrate(acts, spec)
+    cal = rc.choose_channels(acts, spec)
     streams, xh = rc.encode(acts, spec, cal)
     h = hashlib.sha256()
     for s in streams:

@@ -90,9 +90,9 @@ def main():
         d = r.d
         n_cal = min(32, r.n_seq)
         sample = torch.stack([torch.stack(r.read(l, slice(0, n_cal))) for l in r.layers])
-        cal = rc.calibrate(sample, f"bf16+out{max(8, d // 64)}")
+        cal = rc.choose_channels(sample, f"bf16+out{max(8, d // 64)}")
         keep = torch.ones(d, dtype=torch.bool)
-        keep[cal.outliers.flatten().unique()] = False
+        keep[cal.ids.flatten().unique()] = False
         rms = float(sample[..., keep].pow(2).mean().sqrt())
         ident = I.kl_ppl(run, tokens[:8], I.Patcher(L, lambda l, x, s, st: x), batch=a.batch)
     assert ident["kl_mean"] == 0.0, ident
@@ -123,11 +123,11 @@ def main():
             t2 = time.time()
             with rc.open(stem) as r:
                 rec["file_eval"] = I.kl_ppl(run, tokens[:n_kl], I.Patcher(L, r, only=[a.layers[-1]]), seq_ids=list(range(n_kl)), batch=a.batch)
-                calib = r.calib
+                channels = r.channels
             rec["file_eval_seconds"] = round(time.time() - t2, 1)
             if not a.no_live:
                 t3 = time.time()
-                rec["live_eval"] = I.kl_ppl(run, tokens[:n_kl], I.Patcher(L, I.LiveCodec(spec, calib)), batch=a.batch)
+                rec["live_eval"] = I.kl_ppl(run, tokens[:n_kl], I.Patcher(L, I.LiveCodec(spec, channels)), batch=a.batch)
                 rec["live_eval_seconds"] = round(time.time() - t3, 1)
         if want_per and "per_layer_eval" not in rec:
             t5 = time.time()
@@ -139,7 +139,7 @@ def main():
         if want_coh and "coherence" not in rec:
             t4 = time.time()
             with rc.open(stem) as r:
-                co = I.coherence(run, PROMPTS[: a.n_prompts], I.Patcher(L, I.LiveCodec(spec, r.calib)), tokenizer=tok,
+                co = I.coherence(run, PROMPTS[: a.n_prompts], I.Patcher(L, I.LiveCodec(spec, r.channels)), tokenizer=tok,
                                  n_new=a.n_new, seeds=a.seeds, device=dev)
             rec["coherence"] = co["summary"]
             rec["coherence_seconds"] = round(time.time() - t4, 1)

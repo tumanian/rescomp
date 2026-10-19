@@ -9,7 +9,8 @@
 """
 from ._version import __version__
 from .spec import Spec
-from .codec import Calib, calibrate, Encoder, Decoder, encode, decode
+from .bf16_wrapper import OutlierChannels, choose_channels
+from .codec import Encoder, Decoder, encode, decode
 from .store import Store, Reader, transcode, is_v2
 from .sink import Sink, Layers
 from .regimes import REGIMES, resolve as resolve_spec
@@ -28,5 +29,5 @@ def hf_layers(model, layers, tokenizer=None, model_id=None, revision=None):
     return _hf(model, layers, tokenizer, model_id, revision)
 
 
-__all__ = ["Spec", "Calib", "calibrate", "Encoder", "Decoder", "encode", "decode", "Store", "Reader", "transcode",
+__all__ = ["Spec", "OutlierChannels", "choose_channels", "Encoder", "Decoder", "encode", "decode", "Store", "Reader", "transcode",
            "is_v2", "open", "Sink", "Layers", "hf_layers", "tl_layers", "REGIMES", "resolve_spec", "__version__"]

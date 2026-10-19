@@ -35,7 +35,7 @@ def test_hf_layers_and_forward(tiny_model, fake_tok, tmp_path):
     with rc.open(str(tmp_path / "hf")) as r:
         assert r.n_seq == 5 and r.header["n_chunks"] == 2
         assert torch.equal(torch.stack(r.tokens()), toks) and r.attention_mask(4).tolist() == [1] * 7 + [0] * 3
-        exp = rc.encode(hidden(tiny_model, toks[:3], [1, 3]), r.spec, r.calib)[1]   # the encoder saw the fp32 activations
+        exp = rc.encode(hidden(tiny_model, toks[:3], [1, 3]), r.spec, r.channels)[1]   # the encoder saw the fp32 activations
         assert torch.equal(torch.stack(r.read(3, [0, 1, 2])), exp[1])
     with pytest.raises(ValueError):
         rc.hf_layers(tiny_model, [9])
