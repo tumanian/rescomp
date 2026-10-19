@@ -21,7 +21,7 @@ import torch.nn.functional as F
 
 from .bf16_wrapper import OutlierChannels
 from .codec import Encoder
-from .sink import Layers, _first
+from .hooks import CallHooks, Layers
 from .spec import Spec
 
 
@@ -82,16 +82,18 @@ class Patcher:
 
     def __init__(self, layers, source, only: Optional[list] = None):
         L = layers if isinstance(layers, Layers) else Layers(modules=dict(layers))
-        self.modules = {l: m for l, m in L.modules.items() if only is None or l in only}
-        self.order = sorted(self.modules)
-        if not self.order:
-            raise ValueError("no layers to patch")
+        if only is not None:
+            missing = [l for l in only if l not in L.modules]
+            if missing:
+                raise ValueError(f"layers {missing} are not hooked; have {sorted(L.modules)}")
+            L = L.subset([l for l in sorted(L.modules) if l in only])
+        self.hooks = CallHooks(L, on_layer=self._on_layer, tokens=False)
+        self.order = self.hooks.order
         if hasattr(source, "read") and hasattr(source, "layers"):
             source = StoreSource(source)
         self.source = source
         if hasattr(source, "bind"):
-            source.bind(self.order, sorted(L.modules))
-        self._handles = []
+            source.bind(self.order, sorted(layers.modules) if isinstance(layers, Layers) else sorted(layers))
         self._seq_ids, self._starts = None, None
 
     def sequences(self, seq_ids, starts=None):
@@ -100,22 +102,15 @@ class Patcher:
         self._starts = list(starts) if starts is not None else [0] * len(self._seq_ids)
         return self
 
-    def _hook(self, l):
-        def fn(mod, inp, out):
-            x = _first(out)
-            new = self.source(l, x, self._seq_ids, self._starts).to(x.device, x.dtype)
-            return (new,) + tuple(out[1:]) if isinstance(out, tuple) else new
-        return fn
+    def _on_layer(self, l, x, call):
+        return self.source(l, x, self._seq_ids, self._starts)
 
     def __enter__(self):
-        if not self._handles:
-            self._handles = [self.modules[l].register_forward_hook(self._hook(l)) for l in self.order]
+        self.hooks.attach()
         return self
 
     def __exit__(self, *exc):
-        for h in self._handles:
-            h.remove()
-        self._handles = []
+        self.hooks.detach()
 
 
 # ---------------------------------------------------------------- measurements

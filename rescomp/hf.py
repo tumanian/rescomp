@@ -9,7 +9,7 @@ Only this module imports transformers.
 """
 import torch
 
-from .sink import Layers, extract_tokens_generic
+from .hooks import Layers, extract_tokens_generic
 
 BLOCK_ATTRS = ["model.layers", "transformer.h", "model.decoder.layers", "gpt_neox.layers", "layers"]
 CONFIG_KEYS = ["hidden_size", "n_embd", "num_hidden_layers", "n_layer", "num_attention_heads", "n_head",

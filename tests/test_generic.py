@@ -9,7 +9,8 @@ import torch
 
 import rescomp as rc
 from rescomp import instrument as I
-from rescomp.sink import Layers, Sink
+from rescomp.hooks import Layers
+from rescomp.sink import Sink
 
 D, L, V = 32, 3, 50
 

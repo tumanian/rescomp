@@ -3,7 +3,8 @@ import pytest
 import torch
 
 import rescomp as rc
-from rescomp.sink import Layers, Sink, extract_tokens_generic
+from rescomp.hooks import Layers, extract_tokens_generic
+from rescomp.sink import Sink
 from tests.test_generic import D, L, V, ToyLM
 
 ToyWithForward = ToyLM

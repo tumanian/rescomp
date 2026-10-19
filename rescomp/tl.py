@@ -1,5 +1,5 @@
 """TransformerLens: which modules a Sink hooks (hook points are modules) and what the header should say."""
-from .sink import Layers, extract_tokens_generic
+from .hooks import Layers, extract_tokens_generic
 
 
 def tl_layers(model, layers, model_id=None):

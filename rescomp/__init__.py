@@ -12,7 +12,8 @@ from .spec import Spec
 from .bf16_wrapper import OutlierChannels, choose_channels
 from .codec import Encoder, Decoder, encode, decode
 from .store import Store, Reader, transcode, is_v2
-from .sink import Sink, Layers
+from .sink import Sink
+from .hooks import Layers
 from .regimes import REGIMES, resolve as resolve_spec
 from .tl import tl_layers
 
