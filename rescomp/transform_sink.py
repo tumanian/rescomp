@@ -39,14 +39,18 @@ class TransformSink(Sink):
 
     # -- extension point 1: pool the layer instead of encoding it
     def _layer_step(self, i, l, x, call):
+        if call["cont"]:
+            return                                     # the model says this is a cached step: nothing to pool
         if i == 0:
             m = call["mask"]
+            if m is not None and m.shape[-1] != x.shape[1]:
+                m = m[..., -x.shape[1]:]                 # a generation step without the cache signal: the mask covers the whole sequence so far
             call["mask_on"] = None if m is None else m.to(x.device)
         call.setdefault("pooled", {})[l] = self.transform(x, call["mask_on"])
 
     # -- extension point 2: accumulate; a chunk is emitted when enough sequences are in
     def _call_step(self, call, cont):
-        if cont:
+        if cont or call["cont"]:
             self.n_skipped += 1
             return
         seq_ids, _ = self._register(call, False)
