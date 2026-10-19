@@ -36,10 +36,11 @@ def cmd_info(a):
 
 
 def cmd_capture(a):
-    from corpus import wikitext_sequences          # beside this file
-    from rescomp.hf import load_model
+    from corpus import wikitext_sequences  # beside this file
+
     from rescomp.bindings import bind
     from rescomp.codec import Codec
+    from rescomp.hf import load_model
     from rescomp.sink import Sink
     model, tok = load_model(a.model, dtype=a.dtype, revision=a.revision, attn_implementation=a.attn)
     tokens = wikitext_sequences(tok, a.n_seq, a.seq_len, seed=a.seed, bos=a.bos)
@@ -52,8 +53,8 @@ def cmd_capture(a):
 
 def cmd_eval(a):
     from rescomp import instrument as I
-    from rescomp.hf import load_model
     from rescomp.bindings import bind
+    from rescomp.hf import load_model
     from rescomp.store import Reader
     with Reader(a.stem) as r:
         header, layers, spec, channels = r.header, r.layers, r.spec, r.channels

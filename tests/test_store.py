@@ -1,4 +1,4 @@
-"""Format 3: rotated blob files + Parquet tables, written by Store and read back by Reader."""
+"""Format 4: rotated blob files + Parquet table parts (one per flush, meta last), written by Store and read back by Reader."""
 import os
 
 import numpy as np
@@ -8,8 +8,8 @@ import pytest
 import torch
 
 import rescomp as rc
-from rescomp.bf16_wrapper import choose_channels
 from rescomp import store as S
+from rescomp.bf16_wrapper import choose_channels
 from tests.conftest import make_acts
 
 MODEL = {"id": "test/tiny", "revision": "abc", "n_layers": 12, "d_model": 64, "dtype": "bfloat16"}
@@ -47,7 +47,7 @@ def test_roundtrip(tmp_path):
     acts, tokens, expect = write_store(stem)
     assert S.is_capture(stem) and not S.is_capture(str(tmp_path / "nope"))
     assert sorted(os.path.basename(p) for p in os.listdir(tmp_path)) == [
-        "run.00000.rsc", "run.blobs.parquet", "run.chunks.parquet", "run.meta.parquet", "run.tokens.parquet"]
+        "run.00000.rsc", "run.blobs.00000.parquet", "run.chunks.00000.parquet", "run.meta.parquet", "run.tokens.00000.parquet"]
     with S.Reader(stem) as r:
         assert r.layers == LAYERS and r.n_seq == 10 and r.d == 64 and r.spec.name == "int4_g16+layerK2+out2"
         assert r.header["model"] == MODEL and r.header["extra"] == {"note": "x"}
@@ -64,7 +64,8 @@ def test_roundtrip(tmp_path):
         assert torch.equal(r.annotation("vec", 1), torch.tensor([1, 2, 3]))
         padded, mask = r.read_padded(8, [0, 1])
         assert padded.shape == (2, 8, 64) and mask.all()
-        assert "run: RSC3 v3" in r.summary() and "annotations: doc_id, tag, vec" in r.summary()
+        assert "run: RSC4 v4" in r.summary() and "annotations: doc_id, tag, vec" in r.summary()
+        assert r.header["location"] == "run" and "/" not in r.header["location"]     # no local paths in the file
         assert r.sequences().num_rows == 10 and abs(r.header["fidelity"]["rel_l2"] - float((expect - acts).norm() / acts.norm())) < 1e-6
         with pytest.raises(KeyError):
             r.read(7)
@@ -150,6 +151,84 @@ def test_store_validation(tmp_path):
         st.add_chunk([0], [0], [{}] * 4, [])
 
 
+def test_overwrite_refused_unless_asked(tmp_path):
+    stem = str(tmp_path / "o")
+    write_store(stem)
+    with pytest.raises(FileExistsError, match="overwrite=True"):
+        S.Store(stem, model=MODEL, layers=LAYERS, codec="bf16")
+    with pytest.raises(FileExistsError):
+        rc.transcode(stem, stem, "bf16")
+    with S.Store(stem, model=MODEL, layers=[8], codec="bf16", overwrite=True) as st:
+        st.new_sequence([1])
+        st.add_chunk([0], [0], rc.Codec("bf16").encode(make_acts(L=1, B=1, T=2, d=64))[0], None)
+    with S.Reader(stem) as r:
+        assert r.layers == [8] and r.n_seq == 1 and r.header["n_parts"] == 1
+    assert sorted(os.path.basename(p) for p in os.listdir(tmp_path) if p.startswith("o.")) == [
+        "o.00000.rsc", "o.blobs.00000.parquet", "o.chunks.00000.parquet", "o.meta.parquet", "o.tokens.00000.parquet"]
+
+
+def test_reserved_annotation_names(tmp_path):
+    with S.Store(str(tmp_path / "r"), model=MODEL, layers=LAYERS, codec="bf16") as st:
+        with pytest.raises(ValueError, match="reserved"):
+            st.new_sequence([1], seq_id=99)
+        sid = st.new_sequence([1], doc=1)
+        with pytest.raises(ValueError, match="reserved"):
+            st.annotate(sid, tokens=[2])
+        with pytest.raises(ValueError, match="not registered"):
+            st.add_chunk([sid + 1], [0], rc.Codec("bf16").encode(make_acts(L=4, B=1, T=2, d=64))[0], None)
+
+
+def test_flush_writes_only_what_is_new(tmp_path):
+    """Each flush adds one part per table holding only its rows, and the meta table counts the complete parts."""
+    stem = str(tmp_path / "p")
+    spec = rc.Spec.parse("bf16")
+    with S.Store(stem, model=MODEL, layers=LAYERS, codec=spec) as st:
+        for k in range(3):
+            X = make_acts(L=4, B=2, T=3, d=64, seed=k)
+            ids = [st.new_sequence([k, j]) for j in range(2)]
+            st.add_chunk(ids, [0, 0], rc.Codec(spec).encode(X)[0], None)
+            st.flush()
+            assert S.Reader(stem).header["n_parts"] == k + 1
+            assert pq.read_table(S.part_path(S.location(stem), "chunks", k)).column("chunk").to_pylist() == [k]
+            assert pq.read_table(S.part_path(S.location(stem), "tokens", k)).column("seq_id").to_pylist() == ids
+            assert pq.read_table(S.part_path(S.location(stem), "blobs", k)).num_rows == 4
+        st.flush()                                                      # nothing new: no new part
+        st.annotate(0, late="x")
+    with S.Reader(stem) as r:
+        assert r.header["n_parts"] == 4 and r.n_seq == 6 and r.header["n_chunks"] == 3
+        assert r.annotation("late") == ["x", None, None, None, None, None]   # the last part that holds seq 0 wins
+        assert r.sequences().column("n_tokens").to_pylist() == [2] * 6 and torch.equal(r.tokens(5), torch.tensor([2, 1]))
+        assert r.read(9, 4).shape == (3, 64)
+
+
+def test_failed_flush_keeps_the_previous_capture(tmp_path, monkeypatch):
+    """A table write that fails part-way must not publish a meta row that counts rows the tables do not hold."""
+    stem = str(tmp_path / "f")
+    spec = rc.Spec.parse("bf16")
+    st = S.Store(stem, model=MODEL, layers=LAYERS, codec=spec)
+    X = make_acts(L=4, B=1, T=3, d=64)
+    st.add_chunk([st.new_sequence([1])], [0], rc.Codec(spec).encode(X)[0], None)
+    st.flush()
+    st.add_chunk([st.new_sequence([2])], [0], rc.Codec(spec).encode(X)[0], None)
+    real, n = pq.write_table, [0]
+
+    def failing(*a, **k):
+        n[0] += 1
+        if n[0] == 2:
+            raise OSError("disk full")
+        return real(*a, **k)
+    monkeypatch.setattr(pq, "write_table", failing)
+    with pytest.raises(OSError):
+        st.flush()
+    monkeypatch.setattr(pq, "write_table", real)
+    with S.Reader(stem) as r:                                           # the first flush, intact
+        assert r.header["n_sequences"] == 1 and r.header["n_chunks"] == 1 and r.n_seq == 1 and len(r.chunks) == 1
+    st.close()                                                          # the retry publishes both
+    with S.Reader(stem) as r:
+        assert r.header["n_parts"] == 2 and r.n_seq == 2 and len(r.chunks) == 2 and r.read(8, 1).shape == (3, 64)
+    assert not [p for p in os.listdir(tmp_path) if p.endswith(".tmp")]
+
+
 def test_corruption_detected(tmp_path):
     stem = str(tmp_path / "c")
     write_store(stem)
@@ -170,12 +249,12 @@ def test_parquet_schema(tmp_path):
     from rescomp.store import location
     stem = location(str(tmp_path / "s"))
     write_store(stem.path)
-    t = pq.read_table(S.table_path(stem, "tokens"))
+    t = pq.read_table(S.part_path(stem, "tokens", 0))
     assert t.column_names == ["seq_id", "n_tokens", "tokens", "mask", "doc_id", "tag", "vec"]
     assert t.schema.field("tokens").type == pa.list_(pa.int32()) and t.schema.field("vec").type == pa.list_(pa.int64())
-    b = pq.read_table(S.table_path(stem, "blobs"))
+    b = pq.read_table(S.part_path(stem, "blobs", 0))
     assert b.num_rows == 3 * 4 * 3 and set(b.column("stream").to_pylist()) == {"codes", "scale0", "outliers"}
-    c = pq.read_table(S.table_path(stem, "chunks"))
+    c = pq.read_table(S.part_path(stem, "chunks", 0))
     assert c.column("n_seq").to_pylist() == [3, 5, 2] and c.column("seq_ids").to_pylist()[1] == [3, 4, 5, 6, 7]
 
 

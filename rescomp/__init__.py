@@ -8,13 +8,14 @@
     r.read(9, seqs=[0, 1])                    # each sequence whole, fp32: the encoder's own reconstruction
 """
 from ._version import __version__
-from .spec import Spec
-from .codec import Codec
-from .store import Store, Reader, transcode, is_capture
-from .sink import Sink
-from .hooks import Layers
 from .bindings import ModelBinding, ModuleBinding, bind
-from .regimes import REGIMES, resolve as resolve_spec
+from .codec import Codec
+from .hooks import Layers
+from .regimes import REGIMES
+from .regimes import resolve as resolve_spec
+from .sink import Sink
+from .spec import Spec
+from .store import Reader, Store, is_capture, transcode
 
 
 def open(stem, verify=True, bucket=None, prefix=None, s3=None):

@@ -15,7 +15,6 @@ Measurements take a plain callable `run(tokens) -> logits [B, T, V]` (any framew
     coherence(run, prompts, patcher_live, ...) generation with the codec on, paired perplexity per prompt
 """
 import math
-from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -85,7 +84,7 @@ class Patcher:
     """Replace the hooked layers' outputs with reconstructions from `source` (a Reader, LiveCodec, or any
     callable (layer, x, seq_ids, starts) -> replacement). Active inside `with patcher:`."""
 
-    def __init__(self, layers, source, only: Optional[list] = None):
+    def __init__(self, layers, source, only: list | None = None):
         L = layers if isinstance(layers, Layers) else Layers(modules=dict(layers))
         if only is not None:
             missing = [l for l in only if l not in L.modules]

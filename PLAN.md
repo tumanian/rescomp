@@ -5,7 +5,7 @@
 ## Where it ended up (2026-10-19)
 
 The plan below is the original. What was built differs in these ways: the file is a stem of Parquet tables plus
-rotated tensor files (format 3) instead of one `RSC1` file; the writer is a `Sink` that hooks the running model
+rotated tensor files (format 4) instead of one `RSC1` file; the writer is a `Sink` that hooks the running model
 (no `Writer.write` / `capture(adapter)`); outlier channels are chosen on the first call instead of a separate
 `calibrate` step; `uabs` was dropped (not one of the four regimes); the CLI lives in `scripts/`; the lossy stage
 runs on the model's device and only zstd and the writes stay on the CPU. README.md and DESIGN.md describe the result.

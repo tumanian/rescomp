@@ -12,8 +12,8 @@ call) to `on_layer`, whose return value, if not None, replaces the layer's outpu
 hooked layer fires, `on_end(call)` runs. A call whose last hooked layer never fires counts as incomplete.
 `give_tokens(ids, mask)` supplies the next call's tokens explicitly instead of the pre-hook.
 """
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Optional
 
 import torch
 
@@ -21,12 +21,12 @@ import torch
 @dataclass
 class Layers:
     """Which modules to hook, plus what the file header should know about them."""
-    modules: Dict[int, torch.nn.Module]
-    root: Optional[torch.nn.Module] = None                      # for the token pre-hook
-    hook_names: Dict[int, dict] = field(default_factory=dict)
+    modules: dict[int, torch.nn.Module]
+    root: torch.nn.Module | None = None                      # for the token pre-hook
+    hook_names: dict[int, dict] = field(default_factory=dict)
     model_info: dict = field(default_factory=dict)
-    extract: Optional[Callable] = None                          # (args, kwargs) -> (ids, mask, continuation|None)
-    n_layers: Optional[int] = None
+    extract: Callable | None = None                          # (args, kwargs) -> (ids, mask, continuation|None)
+    n_layers: int | None = None
 
     def subset(self, layers):
         missing = [l for l in layers if l not in self.modules]
