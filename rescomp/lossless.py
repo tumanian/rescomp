@@ -1,14 +1,16 @@
-"""Lossless stage: the bytes of a code or scale tensor -> compressed bytes, built by `lossless(record)`.
+"""Lossless stages (registered Stages): the bytes of a code or scale tensor -> compressed bytes, built by `lossless(record)`.
 
 One implementation today, ZstdShuffle: byte-shuffle (group the k-th byte of every element together, which won
 122 of 124 times against bit-shuffle and raw in the earlier sweep) then zstd. The header records the backend
 as {"codec": name, ...options}, so another backend is a subclass plus a header value.
 """
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 
 import numpy as np
 import torch
 import zstandard
+
+from .stage import Stage, register, stage
 
 DTYPES = {"float64": torch.float64, "float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16,
           "float8_e4m3fn": torch.float8_e4m3fn, "float8_e8m0fnu": torch.float8_e8m0fnu, "int8": torch.int8,
@@ -38,8 +40,13 @@ def unshuffle(b, elem):
     return b if elem == 1 or len(b) == 0 else b.reshape(elem, -1).T.copy().ravel()
 
 
-class Lossless(ABC):
-    name: str
+class Lossless(Stage):
+    kind = "lossless"
+    name: str                      # the one name a backend answers to
+
+    @classmethod
+    def matches(cls, name):
+        return name == cls.name
 
     @abstractmethod
     def compress(self, t):
@@ -49,15 +56,14 @@ class Lossless(ABC):
     def decompress(self, blob, dtype, shape, raw_nbytes):
         """compressed bytes -> tensor of dtype/shape (CPU)."""
 
-    @abstractmethod
-    def to_dict(self):
-        ...
 
 
+@register
 class ZstdShuffle(Lossless):
     name = "zstd"
 
-    def __init__(self, level=3, shuffle=True):
+    def __init__(self, name="zstd", level=3, shuffle=True):
+        super().__init__(name)
         self.level, self.shuffle = int(level), bool(shuffle)
 
     def to_dict(self):
@@ -87,14 +93,11 @@ class ZstdShuffle(Lossless):
         return torch.from_numpy(b).view(dtype).reshape(list(shape))
 
 
-BACKENDS = {ZstdShuffle.name: ZstdShuffle}
-
-
 def lossless(record=None, **options):
-    """Factory: from a header record {"codec": "zstd", "level": 3, "shuffle": True} or keyword options."""
-    rec = dict(record or {})
+    """Factory: from a header record {"codec": "zstd", "level": 3, "shuffle": True}, a backend name, or keyword
+    options; a Lossless instance passes through."""
+    if isinstance(record, Lossless):
+        return record
+    rec = {"codec": record} if isinstance(record, str) else dict(record or {})
     rec.update(options)
-    name = rec.pop("codec", "zstd")
-    if name not in BACKENDS:
-        raise ValueError(f"unknown lossless backend {name!r}; have {sorted(BACKENDS)}")
-    return BACKENDS[name](**rec)
+    return stage("lossless", rec.pop("codec", "zstd"), **rec)
