@@ -34,11 +34,12 @@ def cmd_info(a):
 
 def cmd_capture(a):
     from .data import wikitext_sequences
-    from .hf import hf_layers, load_model
+    from .hf import load_model
+    from .bindings import bind
     from .sink import Sink
     model, tok = load_model(a.model, dtype=a.dtype, revision=a.revision, attn_implementation=a.attn)
     tokens = wikitext_sequences(tok, a.n_seq, a.seq_len, seed=a.seed, bos=a.bos)
-    with Sink(a.out, hf_layers(model, a.layers, tok, model_id=a.model, revision=a.revision), a.spec, level=a.level,
+    with Sink(a.out, bind(model, a.layers, tokenizer=tok, model_id=a.model, revision=a.revision), a.spec, level=a.level,
               fidelity=a.fidelity) as sink, torch.no_grad():
         for i in range(0, a.n_seq, a.batch):
             model(tokens[i: i + a.batch].to(sink.layers.root.get_input_embeddings().weight.device), use_cache=False)
@@ -47,7 +48,8 @@ def cmd_capture(a):
 
 def cmd_eval(a):
     from . import instrument as I
-    from .hf import hf_layers, load_model
+    from .hf import load_model
+    from .bindings import bind
     from .store import Reader
     with Reader(a.stem) as r:
         header, layers, spec, channels = r.header, r.layers, r.spec, r.channels
@@ -58,7 +60,7 @@ def cmd_eval(a):
         tokens = torch.stack(toks)
     model_id = a.model or header["model"]["id"]
     model, tok = load_model(model_id, dtype=a.dtype, revision=header["model"].get("revision"))
-    L = hf_layers(model, layers, tok)
+    L = bind(model, layers, tokenizer=tok)
     dev = model.get_input_embeddings().weight.device
     run = lambda t: model(t.to(dev), use_cache=False).logits
     out = {"stem": a.stem, "model": model_id, "spec": spec.name, "bytes": header["bytes"], "fidelity": header["fidelity"]}

@@ -1,7 +1,4 @@
-"""Hugging Face causal LMs: which modules a Sink hooks, what the header should say, and a loader.
-
-    model, tok = load_model("gpt2")
-    sink = Sink("runs/x", layers=hf_layers(model, [8, 9, 10, 11], tok), spec="balanced")
+"""Hugging Face causal LMs: the binding (which modules a Sink hooks, what the header says) and a loader.
 
 The site is "resid_post": the output of decoder block l (`model.layers[l]` / `transformer.h[l]`), which is
 TransformerLens `blocks.l.hook_resid_post` when that library loads the model without weight processing.
@@ -9,7 +6,7 @@ Only this module imports transformers.
 """
 import torch
 
-from .hooks import Layers, extract_tokens_generic
+from .bindings import ModelBinding
 
 BLOCK_ATTRS = ["model.layers", "transformer.h", "model.decoder.layers", "gpt_neox.layers", "layers"]
 CONFIG_KEYS = ["hidden_size", "n_embd", "num_hidden_layers", "n_layer", "num_attention_heads", "n_head",
@@ -33,38 +30,36 @@ def decoder_blocks(model):
     raise ValueError(f"cannot find the decoder block list on {type(model).__name__}; tried {BLOCK_ATTRS}")
 
 
-def moe_layers(model):
-    """Layers whose MLP is a routed mixture of experts (HF layout: block.mlp.gate + block.mlp.experts)."""
-    blocks, _ = decoder_blocks(model)
-    return [l for l, b in enumerate(blocks) if hasattr(getattr(b, "mlp", None), "gate") and hasattr(b.mlp, "experts")]
+class HuggingFaceBinding(ModelBinding):
+    loader = "transformers"
 
+    def __init__(self, model):
+        super().__init__(model)
+        self._blocks, self.block_path = decoder_blocks(model)
 
-def model_info(model, tokenizer=None, model_id=None, revision=None):
-    """What goes into the file header: id, revision, architecture, sizes, dtype, a config summary."""
-    c = model.config
-    blocks, _ = decoder_blocks(model)
-    cfg = {k: getattr(c, k) for k in CONFIG_KEYS if getattr(c, k, None) is not None}
-    moe = moe_layers(model)
-    if moe:
-        cfg["moe_layers"] = moe
-    return {"id": model_id or getattr(c, "_name_or_path", None), "revision": revision or getattr(c, "_commit_hash", None),
-            "loader": "transformers", "architecture": (getattr(c, "architectures", None) or [type(model).__name__])[0],
-            "n_layers": len(blocks), "d_model": getattr(c, "hidden_size", None) or getattr(c, "n_embd", None),
-            "dtype": str(next(model.parameters()).dtype).removeprefix("torch."),
-            "tokenizer": getattr(tokenizer, "name_or_path", None),
-            "bos_token_id": getattr(tokenizer, "bos_token_id", None), "config": cfg}
+    def blocks(self):
+        return dict(enumerate(self._blocks))
 
+    def hook_name(self, layer):
+        return {"hf": f"{self.block_path}.{layer}", "transformer_lens": f"blocks.{layer}.hook_resid_post"}
 
-def hf_layers(model, layers, tokenizer=None, model_id=None, revision=None):
-    """Modules to hook for a Sink: the decoder blocks of `layers`, with header info and the HF token extractor."""
-    blocks, path = decoder_blocks(model)
-    layers = sorted(int(l) for l in layers)
-    if any(not 0 <= l < len(blocks) for l in layers):
-        raise ValueError(f"layers {layers} outside [0, {len(blocks)})")
-    return Layers(modules={l: blocks[l] for l in layers}, root=model,
-                  hook_names={l: {"hf": f"{path}.{l}", "transformer_lens": f"blocks.{l}.hook_resid_post"} for l in layers},
-                  model_info=model_info(model, tokenizer, model_id, revision), extract=extract_tokens_generic,
-                  n_layers=len(blocks))
+    def moe_layers(self):
+        """Layers whose MLP is a routed mixture of experts (HF layout: block.mlp.gate + block.mlp.experts)."""
+        return [l for l, b in enumerate(self._blocks)
+                if hasattr(getattr(b, "mlp", None), "gate") and hasattr(b.mlp, "experts")]
+
+    def info(self, tokenizer=None, model_id=None, revision=None):
+        c = self.model.config
+        cfg = {k: getattr(c, k) for k in CONFIG_KEYS if getattr(c, k, None) is not None}
+        moe = self.moe_layers()
+        if moe:
+            cfg["moe_layers"] = moe
+        return {"id": model_id or getattr(c, "_name_or_path", None), "revision": revision or getattr(c, "_commit_hash", None),
+                "loader": self.loader, "architecture": (getattr(c, "architectures", None) or [type(self.model).__name__])[0],
+                "n_layers": len(self._blocks), "d_model": getattr(c, "hidden_size", None) or getattr(c, "n_embd", None),
+                "dtype": str(next(self.model.parameters()).dtype).removeprefix("torch."),
+                "tokenizer": getattr(tokenizer, "name_or_path", None),
+                "bos_token_id": getattr(tokenizer, "bos_token_id", None), "config": cfg}
 
 
 def load_model(model_id, dtype="bfloat16", device=None, revision=None, attn_implementation=None, device_map=None, **kw):

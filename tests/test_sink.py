@@ -3,7 +3,7 @@ import pytest
 import torch
 
 import rescomp as rc
-from rescomp.hooks import Layers, extract_tokens_generic
+from rescomp.hooks import extract_tokens_generic
 from rescomp.sink import Sink
 from tests.test_generic import D, L, V, ToyLM
 
@@ -16,8 +16,8 @@ def lm():
 
 
 def layers_of(lm, idx=(0, 1, 2)):
-    return Layers(modules={l: lm.blocks[l] for l in idx}, root=lm, hook_names={l: {"toy": f"blocks.{l}"} for l in idx},
-                  model_info={"id": "toy", "d_model": D}, n_layers=L)
+    return rc.bind({l: lm.blocks[l] for l in idx}, root=lm, hook_names={l: {"toy": f"blocks.{l}"} for l in idx},
+                   info={"d_model": D, "n_layers": L}, model_id="toy")
 
 
 def reference(lm, toks, idx=(0, 1, 2)):

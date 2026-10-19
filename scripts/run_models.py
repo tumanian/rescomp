@@ -20,7 +20,8 @@ import rescomp as rc                                   # noqa: E402
 from rescomp import instrument as I                    # noqa: E402
 from rescomp.cli import PROMPTS                        # noqa: E402
 from rescomp.data import wikitext_sequences            # noqa: E402
-from rescomp.hf import hf_layers, load_model           # noqa: E402
+from rescomp.hf import load_model                      # noqa: E402
+from rescomp.bindings import bind                      # noqa: E402
 
 DEFAULT_SPECS = ["exact", "faithful", "balanced", "compact", "fp8_e4m3+out8", "nvfp4+layerK4+out8",
                  "mxfp4+layerK4+out8", "int4_g64+layerK4+out8", "int4_g{G}+layerK4+out{O}", "int4_g{G8}+out{O2}"]
@@ -72,7 +73,7 @@ def main():
     dev = model.get_input_embeddings().weight.device
     print(f"loaded {a.model} in {time.time() - t0:.0f}s on {set(str(p.device) for p in model.parameters())}", flush=True)
     tokens = wikitext_sequences(tok, a.n_seq, a.seq_len, seed=0, bos=a.bos, split=a.dataset_split)
-    L = hf_layers(model, a.layers, tok, model_id=a.model, revision=a.revision)
+    L = bind(model, a.layers, tokenizer=tok, model_id=a.model, revision=a.revision)
     run = lambda t: model(t.to(dev), use_cache=False).logits
     base = str(out / "base")
     if not rc.is_v2(base):

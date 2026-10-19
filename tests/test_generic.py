@@ -9,7 +9,6 @@ import torch
 
 import rescomp as rc
 from rescomp import instrument as I
-from rescomp.hooks import Layers
 from rescomp.sink import Sink
 
 D, L, V = 32, 3, 50
@@ -57,8 +56,8 @@ def toy():
 
 
 def toy_layers(lm, idx=(0, 1, 2)):
-    return Layers(modules={l: lm.blocks[l] for l in idx}, root=lm, hook_names={l: {"toy": f"blocks.{l}"} for l in idx},
-                  model_info={"id": "toy-lm", "framework": "plain torch", "d_model": D}, n_layers=L)
+    return rc.bind({l: lm.blocks[l] for l in idx}, root=lm, hook_names={l: {"toy": f"blocks.{l}"} for l in idx},
+                   info={"framework": "plain torch", "d_model": D, "n_layers": L}, model_id="toy-lm")
 
 
 @pytest.fixture
@@ -82,7 +81,8 @@ def test_pipeline_without_transformers(toy, tmp_path, no_transformers):
         toy(toks[:4])
         toy(toks[4:])
     with rc.open(stem) as r:
-        assert r.header["model"]["id"] == "toy-lm" and r.header["layers"][1]["hook"] == {"toy": "blocks.1"}
+        assert r.header["model"]["id"] == "toy-lm" and r.header["model"]["loader"] == "modules"
+        assert r.header["layers"][1]["hook"] == {"toy": "blocks.1"} and r.header["model"]["n_layers"] == L
         assert r.n_seq == 10 and r.annotation("doc")[:4] == [0, 1, 2, 3] and r.header["fidelity"]["rel_l2"] > 0
         X = toy.activations(toks[:4], (0, 1, 2))
         assert torch.equal(torch.stack(r.read(2, [0, 1, 2, 3])), rc.encode(X, r.spec, r.channels)[1][2])

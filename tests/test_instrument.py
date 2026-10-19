@@ -95,7 +95,7 @@ def test_coherence(lm):
 
 def test_hf_patcher(tiny_model, fake_tok, toks):
     """Same measurement on a Hugging Face model: run() is just the model call."""
-    L = rc.hf_layers(tiny_model, [1, 2, 3], fake_tok)
+    L = rc.bind(tiny_model, [1, 2, 3], tokenizer=fake_tok)
     run = lambda t: tiny_model(t, use_cache=False).logits
     t = torch.randint(2, 256, (6, 9), generator=torch.Generator().manual_seed(1))
     k = I.kl_ppl(run, t, I.Patcher(L, I.LiveCodec("int8_tok+layerK3")), batch=3)

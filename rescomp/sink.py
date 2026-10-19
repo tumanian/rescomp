@@ -1,12 +1,12 @@
 """The Sink: hooks on a running model, activations flow into a format-2 store. The model is not wrapped.
 
-    sink = Sink("runs/run1", layers=hf_layers(model, [8, 9, 10, 11]), spec="balanced")   # a regime or a spec string
+    sink = Sink("runs/run1", layers=bind(model, [8, 9, 10, 11]), spec="balanced")   # a regime or a spec string
     with sink:
         model(**batch)              # one forward call = one chunk
         model.generate(**prompt)    # each step = one chunk; the reader returns the sequence whole
     sink.stats()
 
-`layers` is a `Layers` (from hf_layers / tl_layers) or a plain {layer: nn.Module} dict; the hook on each module
+`layers` is a `Layers` (from `bind`) or a plain {layer: nn.Module} dict; the hook on each module
 takes its output (the residual stream after that layer). Tokens: given with `sink.tokens(ids, mask)` before a
 forward, or taken by a forward pre-hook on the root model (`input_ids` keyword or first positional argument);
 `tokens="off"` records none.

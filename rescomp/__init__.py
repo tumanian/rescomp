@@ -1,7 +1,7 @@
 """rescomp: compress the residual-stream activations of a running model and keep them, with their metadata.
 
     import rescomp as rc
-    sink = rc.Sink("runs/x", layers=rc.hf_layers(model, [8, 9, 10, 11], tok), spec="balanced")
+    sink = rc.Sink("runs/x", layers=rc.bind(model, [8, 9, 10, 11], tokenizer=tok), spec="balanced")
     with sink:
         model(**batch)                        # the model runs untouched; one forward call = one chunk
     r = rc.open("runs/x")
@@ -14,8 +14,8 @@ from .codec import Encoder, Decoder, encode, decode
 from .store import Store, Reader, transcode, is_v2
 from .sink import Sink
 from .hooks import Layers
+from .bindings import ModelBinding, ModuleBinding, bind
 from .regimes import REGIMES, resolve as resolve_spec
-from .tl import tl_layers
 
 
 def open(stem, verify=True, bucket=None, prefix=None, s3=None):
@@ -24,11 +24,5 @@ def open(stem, verify=True, bucket=None, prefix=None, s3=None):
     return Reader(stem, verify=verify, bucket=bucket, prefix=prefix, s3=s3)
 
 
-def hf_layers(model, layers, tokenizer=None, model_id=None, revision=None):
-    """Modules to hook for a Sink on a Hugging Face causal LM (imports transformers lazily)."""
-    from .hf import hf_layers as _hf
-    return _hf(model, layers, tokenizer, model_id, revision)
-
-
 __all__ = ["Spec", "OutlierChannels", "choose_channels", "Encoder", "Decoder", "encode", "decode", "Store", "Reader", "transcode",
-           "is_v2", "open", "Sink", "Layers", "hf_layers", "tl_layers", "REGIMES", "resolve_spec", "__version__"]
+           "is_v2", "open", "Sink", "Layers", "ModelBinding", "ModuleBinding", "bind", "REGIMES", "resolve_spec", "__version__"]

@@ -56,7 +56,7 @@ def main():
         res = {}
         for fid in (False, True):
             with tempfile.TemporaryDirectory() as d:
-                sink = rc.Sink(f"{d}/ov", rc.hf_layers(model, a.layers, tok), a.spec, buffer_bytes=1 << 40, fidelity=fid,
+                sink = rc.Sink(f"{d}/ov", rc.bind(model, a.layers, tokenizer=tok), a.spec, buffer_bytes=1 << 40, fidelity=fid,
                                compile=a.compile)
                 with sink:
                     timed(run, 3, sync)

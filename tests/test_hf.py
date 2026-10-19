@@ -13,20 +13,25 @@ from rescomp.cli import main
 def test_decoder_blocks_and_info(tiny_model, fake_tok):
     blocks, path = H.decoder_blocks(tiny_model)
     assert len(blocks) == 4 and path == "transformer.h"
-    info = H.model_info(tiny_model, fake_tok, model_id="x/y")
+    info = H.HuggingFaceBinding(tiny_model).info(fake_tok, model_id="x/y")
     assert info["n_layers"] == 4 and info["d_model"] == 64 and info["id"] == "x/y" and info["dtype"] == "float32"
     assert info["config"]["n_head"] == 4 and info["loader"] == "transformers" and info["tokenizer"] == "fake"
     with pytest.raises(ValueError):
         H.decoder_blocks(torch.nn.Linear(2, 2))
-    L = H.hf_layers(tiny_model, [1, 3], fake_tok)
+    L = rc.bind(tiny_model, [1, 3], tokenizer=fake_tok)
     assert L.hook_names[3] == {"hf": "transformer.h.3", "transformer_lens": "blocks.3.hook_resid_post"}
+    assert L.root is tiny_model and L.n_layers == 4 and L.model_info["loader"] == "transformers"
     with pytest.raises(ValueError):
-        H.hf_layers(tiny_model, [9])
+        rc.bind(tiny_model, [9])
+    with pytest.raises(ValueError):
+        rc.bind(tiny_model)
+    with pytest.raises(ValueError):
+        rc.bind(torch.nn.Linear(2, 2), [0])
 
 
 def test_hooked_site_is_hidden_states(tiny_model, fake_tok, tmp_path):
     toks = torch.randint(2, 256, (3, 10))
-    with rc.Sink(str(tmp_path / "s"), rc.hf_layers(tiny_model, [0, 2], fake_tok), "fp32") as sink:
+    with rc.Sink(str(tmp_path / "s"), rc.bind(tiny_model, [0, 2], tokenizer=fake_tok), "fp32") as sink:
         tiny_model(toks)
     out = tiny_model(toks, output_hidden_states=True)
     with rc.open(str(tmp_path / "s")) as r:
@@ -36,9 +41,9 @@ def test_hooked_site_is_hidden_states(tiny_model, fake_tok, tmp_path):
 
 
 def test_moe_info(tiny_moe, fake_tok, tmp_path):
-    assert H.moe_layers(tiny_moe) == [0, 1]
+    assert H.HuggingFaceBinding(tiny_moe).moe_layers() == [0, 1]
     toks = torch.randint(2, 64, (3, 6))
-    with rc.Sink(str(tmp_path / "moe"), rc.hf_layers(tiny_moe, [1], fake_tok), "fp16") as sink:
+    with rc.Sink(str(tmp_path / "moe"), rc.bind(tiny_moe, [1], tokenizer=fake_tok), "fp16") as sink:
         tiny_moe(toks)
     with rc.open(str(tmp_path / "moe")) as r:
         cfg = r.header["model"]["config"]
@@ -47,7 +52,7 @@ def test_moe_info(tiny_moe, fake_tok, tmp_path):
 
 
 def test_hf_patcher_measurements(tiny_model, fake_tok):
-    L = rc.hf_layers(tiny_model, [1, 2, 3], fake_tok)
+    L = rc.bind(tiny_model, [1, 2, 3], tokenizer=fake_tok)
     run = lambda t: tiny_model(t, use_cache=False).logits
     t = torch.randint(2, 256, (6, 9), generator=torch.Generator().manual_seed(1))
     assert I.kl_ppl(run, t, I.Patcher(L, lambda l, x, s, st: x), batch=3)["kl_mean"] == 0.0
@@ -58,7 +63,7 @@ def test_hf_patcher_measurements(tiny_model, fake_tok):
 def test_cli_info_and_eval(tiny_model, fake_tok, tmp_path, monkeypatch, capsys):
     toks = torch.randint(2, 256, (8, 10), generator=torch.Generator().manual_seed(0))
     stem = str(tmp_path / "c")
-    with rc.Sink(stem, rc.hf_layers(tiny_model, [1, 3], fake_tok, model_id="tiny"), "int4_g16+layerK2") as sink:
+    with rc.Sink(stem, rc.bind(tiny_model, [1, 3], tokenizer=fake_tok, model_id="tiny"), "int4_g16+layerK2") as sink:
         tiny_model(toks[:4])
         tiny_model(toks[4:])
     main(["info", stem])
