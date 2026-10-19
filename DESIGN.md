@@ -63,6 +63,9 @@ counting rows the tables did not hold. Also from that review: a stem that alread
 the header records a local capture by its stem's name rather than its absolute path, and the `exact` regime checks
 each call that fp16 holds the model's values (it clamps at 65504 and flushes below 6e-8; "bit-exact for bf16
 models" held only inside that range).
+A `with Sink` or `with Store` body that raises (the exact check, an OOM, an interrupt) discards what was not
+flushed: the stem reads as it did after the last flush, or holds no capture at all; the GPU re-capture of
+Gemma-2 found the old behaviour writing a half capture with a complete-looking meta table.
 
 ## Pooled rows for probes (2026-10-19)
 
