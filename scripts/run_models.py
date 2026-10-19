@@ -18,10 +18,10 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import rescomp as rc                                   # noqa: E402
 from rescomp import instrument as I                    # noqa: E402
-from rescomp.cli import PROMPTS                        # noqa: E402
-from rescomp.data import wikitext_sequences            # noqa: E402
 from rescomp.hf import load_model                      # noqa: E402
 from rescomp.bindings import bind                      # noqa: E402
+from cli import PROMPTS                                # noqa: E402  (scripts/cli.py, beside this file)
+from corpus import wikitext_sequences                  # noqa: E402
 
 DEFAULT_SPECS = ["exact", "faithful", "balanced", "compact", "fp8_e4m3+out8", "nvfp4+layerK4+out8",
                  "mxfp4+layerK4+out8", "int4_g64+layerK4+out8", "int4_g{G}+layerK4+out{O}", "int4_g{G8}+out{O2}"]

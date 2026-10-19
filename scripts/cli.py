@@ -7,8 +7,11 @@
 import argparse
 import json
 import sys
+from pathlib import Path
 
 import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 PROMPTS = [
     "The history of the Roman Empire", "In a small village at the edge of the forest, an old woman",
@@ -25,7 +28,7 @@ PROMPTS = [
 
 
 def cmd_info(a):
-    from .store import Reader
+    from rescomp.store import Reader
     with Reader(a.stem, verify=not a.no_verify) as r:
         print(r.summary())
         if a.json:
@@ -33,10 +36,10 @@ def cmd_info(a):
 
 
 def cmd_capture(a):
-    from .data import wikitext_sequences
-    from .hf import load_model
-    from .bindings import bind
-    from .sink import Sink
+    from corpus import wikitext_sequences          # beside this file
+    from rescomp.hf import load_model
+    from rescomp.bindings import bind
+    from rescomp.sink import Sink
     model, tok = load_model(a.model, dtype=a.dtype, revision=a.revision, attn_implementation=a.attn)
     tokens = wikitext_sequences(tok, a.n_seq, a.seq_len, seed=a.seed, bos=a.bos)
     with Sink(a.out, bind(model, a.layers, tokenizer=tok, model_id=a.model, revision=a.revision), a.spec, level=a.level,
@@ -47,10 +50,10 @@ def cmd_capture(a):
 
 
 def cmd_eval(a):
-    from . import instrument as I
-    from .hf import load_model
-    from .bindings import bind
-    from .store import Reader
+    from rescomp import instrument as I
+    from rescomp.hf import load_model
+    from rescomp.bindings import bind
+    from rescomp.store import Reader
     with Reader(a.stem) as r:
         header, layers, spec, channels = r.header, r.layers, r.spec, r.channels
         n = min(a.n_seq or r.n_seq, r.n_seq)

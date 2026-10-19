@@ -1,7 +1,12 @@
+import sys
+from pathlib import Path
+
 import pytest
 import torch
 
 import rescomp as rc
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))   # scripts/cli.py, scripts/corpus.py
 
 ALL_SPECS = ["fp32", "bf16", "fp16", "fp8_e4m3", "int8_tok", "int8_g64", "int4_g16", "mxfp4",
              "nvfp4", "int4_g16+layerK2", "int4_g16+layerK4+out4", "int4_g16+layerK2+out4+sink1",

@@ -7,7 +7,6 @@ import torch
 import rescomp as rc
 from rescomp import hf as H
 from rescomp import instrument as I
-from rescomp.cli import main
 
 
 def test_decoder_blocks_and_info(tiny_model, fake_tok):
@@ -60,23 +59,6 @@ def test_hf_patcher_measurements(tiny_model, fake_tok):
     assert kl["fp16"] < kl["int8_tok"] < kl["int4_g16+layerK3"]
 
 
-def test_cli_info_and_eval(tiny_model, fake_tok, tmp_path, monkeypatch, capsys):
-    toks = torch.randint(2, 256, (8, 10), generator=torch.Generator().manual_seed(0))
-    stem = str(tmp_path / "c")
-    with rc.Sink(stem, rc.bind(tiny_model, [1, 3], tokenizer=fake_tok, model_id="tiny"), "int4_g16+layerK2") as sink:
-        tiny_model(toks[:4])
-        tiny_model(toks[4:])
-    main(["info", stem])
-    out = capsys.readouterr().out
-    assert "RSC3" in out and "layers [1, 3]" in out
-    monkeypatch.setattr("rescomp.hf.load_model", lambda *a, **k: (tiny_model, fake_tok))
-    main(["eval", stem, "--batch", "4", "--live", "--coherence", "--n-prompts", "1", "--n-new", "4", "--seeds", "2",
-          "--out", str(tmp_path / "e.json")])
-    res = json.loads((tmp_path / "e.json").read_text())
-    assert res["model"] == "tiny" and 0 <= res["last_layer"]["kl_mean"] < 1 and res["live"]["n_seq"] == 8
-    assert res["coherence"]["n_pairs"] == 2
-
-
 def test_load_model_from_disk(tiny_model, tmp_path):
     from transformers import GPT2TokenizerFast
     tiny_model.save_pretrained(tmp_path / "m")
@@ -86,13 +68,3 @@ def test_load_model_from_disk(tiny_model, tmp_path):
     GPT2TokenizerFast(str(tmp_path / "m" / "vocab.json"), str(tmp_path / "m" / "merges.txt")).save_pretrained(tmp_path / "m")
     model, tok = H.load_model(str(tmp_path / "m"), dtype="float32", device="cpu")
     assert isinstance(model, torch.nn.Module) and hasattr(tok, "encode") and not model.training
-
-
-def test_pack_sequences(fake_tok):
-    from rescomp.data import pack_sequences
-    t = pack_sequences(fake_tok, ["abcdef", "ghijkl", "mnop"], n_seq=2, seq_len=4)
-    assert t.shape == (2, 4) and t[0].tolist() == [ord(c) for c in "abcd"]
-    b = pack_sequences(fake_tok, ["abcdef", "ghijkl"], n_seq=2, seq_len=4, bos=True)
-    assert b[:, 0].tolist() == [0, 0] and b[0, 1:].tolist() == [ord(c) for c in "abc"]
-    with pytest.raises(ValueError):
-        pack_sequences(fake_tok, ["ab"], n_seq=2, seq_len=4)
