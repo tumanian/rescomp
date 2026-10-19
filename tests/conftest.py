@@ -4,7 +4,6 @@ from pathlib import Path
 import pytest
 import torch
 
-import rescomp as rc
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))   # scripts/cli.py, scripts/corpus.py
 

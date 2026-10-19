@@ -8,7 +8,7 @@ reconstructions back into a model, KL, coherence) is a separate regime and must 
 
 ```python
 rec = rc.Sink("run1", layers=rc.bind(model, [8, 9, 10, 11]),         # module objects to hook; HF/TL detected
-                  spec="int4_g384+layerK4+out12",
+                  codec=rc.Codec("int4_g384+layerK4+out12"),              # or a regime name: "balanced"
                   tokens=None)                                             # None: a pre-hook captures input ids
 with rec:                                   # registers forward hooks on the given modules
     model(**batch)                          # one forward call = one chunk
@@ -105,11 +105,17 @@ the suite on x86 and GPU, `scripts/spot_check.py` on a real GPT-2 capture and a 
 - `bindings.py`: `ModelBinding` (`blocks`, `root`, `hook_name`, `info`, `extract_tokens`, `moe_layers`) with
   `HuggingFaceBinding` (`hf.py`), `TransformerLensBinding` (`tl.py`), `ModuleBinding` and the `bind()` factory
   that picks one by the model's type without importing a framework that is not installed.
-- `codec.py`: the per-layer tensor work is one function (`layer_values`, compilable), the checks are functions
-  (`check_layer_index`, `check_order`, `check_width`), `_CodecState` is what carries over between layers.
+- `codec.py`: `Codec` is the one object for how activations are stored (2026-10-19, user's call: lossy or
+  lossless, the machinery hidden). It owns the spec, the outlier channels, the quantizer and the lossless stage;
+  `encoder()`/`decoder()` are its device half (per-chunk state, layer by layer), `pack`/`unpack` its host half,
+  `to_dict`/`from_header` its record in the file. `Sink`, `Store`, `Reader`, `transcode` and `LiveCodec` take or
+  expose a `Codec` and nothing below it. The per-layer tensor work is one function (`layer_values`, compilable),
+  the checks are functions (`check_layer_index`, `check_order`, `check_width`).
+- `stage.py`: `Stage`, the root of what a codec is made of (kind, name, `matches`, `to_dict`), with a registry;
+  `Quantizer` and `Lossless` inherit from it, their factories build through it.
 - `bf16_wrapper.py`: outlier channels and sink rows (`OutlierChannels`, `choose_channels`, `split`, `restore`),
   with the explanation of why they are kept exactly.
-- `quant.py`: `Quantizer` subclasses and `quantizer(name)`; `lossless.py`: `Lossless` subclasses and `lossless()`.
+- `quant.py`: `Quantizer` stages and `quantizer(name)`; `lossless.py`: `Lossless` stages and `lossless()`.
   `uabs` was dropped (not a regime).
 - `store.py`: also holds `Location` / `location` (local or S3); `check_layers`, `check_streams`;
   `transcode(sample_seqs=)` picks the outlier channels on the first sequences of the source.

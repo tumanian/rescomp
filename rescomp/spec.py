@@ -10,7 +10,6 @@ key       hybrid: a different quantizer for keyframe layers (e.g. key=bf16 keeps
 
 Examples: "fp16", "bf16", "int4_g384+layerK4+out12", "int4_g512+layerK4+out32+key=bf16".
 """
-import re
 from dataclasses import dataclass, asdict
 from typing import Optional
 

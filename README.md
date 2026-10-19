@@ -28,7 +28,7 @@ model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-8B", dtype=torch.bfloat
 batch = tok(["The history of the Roman Empire", "To make a tomato sauce, first"], return_tensors="pt", padding=True).to("cuda")
 
 sink = rc.Sink("runs/demo", layers=rc.bind(model, [24, 28, 32, 35], tokenizer=tok),
-               spec="balanced")                                           # a regime, or any spec string
+               codec="balanced")                                          # a regime, a spec string, or rc.Codec(...)
 with sink, torch.no_grad():
     logits = model(**batch).logits                 # one forward call = one chunk
     out = model.generate(**batch, max_new_tokens=80)   # prompt + steps = one sequence per prompt
@@ -54,8 +54,11 @@ r.tokens(2); r.header["model"]; r.header["layers"][1]["fidelity"]
   signal that tells a generation step from a new prompt); `sink.tokens(ids)` overrides, `tokens="off"` disables.
 - `sink.annotate(doc_id=[...], split="train")` labels the sequences the next new-sequence call starts; labels become
   Parquet columns.
-- Outlier channels (`+out`) are chosen per layer on the first forward call unless `channels=` is given
-  (`bf16_wrapper.py` explains what they are and why they are kept exactly).
+- `codec`: one object for how activations are stored, lossy or lossless: `rc.Codec("compact", level=5)`,
+  `rc.Codec("int4_g512+layerK4+out32")`, `rc.Codec("bf16")`. Inside it are the quantizer, the layer deltas, the
+  outlier channels kept in bf16 (chosen per layer on the first forward call unless `channels=` is given) and the
+  zstd stage; which parts run on the device and which on the host is its business, not yours. `codec.lossy` says
+  which kind it is; `compile=True` runs the per-layer kernels through torch.compile (same bytes).
 
 ### Storage (format 3), local or S3
 
@@ -67,7 +70,7 @@ tensor object, so a capture is readable mid-run, and objects are capped at 1 GiB
 fetches blobs with range requests.
 
 ```python
-with rc.Sink("demo", layers=..., spec="balanced", bucket="my-acts", prefix="team/qwen3-8b") as sink: ...
+with rc.Sink("demo", layers=..., codec="balanced", bucket="my-acts", prefix="team/qwen3-8b") as sink: ...
 r = rc.open("s3://my-acts/team/qwen3-8b/demo")
 ```
 
@@ -79,14 +82,15 @@ annotations).
 
 ### Lower level
 
-`rc.encode(X, spec, channels)` / `rc.decode(streams, spec, channels)` on an `[L, B, T, d]` stack
-(`rc.choose_channels(X, spec)` picks the outlier channels from a sample); `rc.Encoder(...)
-.encode_layer(i, x)` one layer at a time (closed-loop deltas); `rc.Store` to write encoded chunks yourself;
-`rc.transcode(src, dst, spec)` to re-encode a stored capture with another spec or regime.
+`codec.encode(X)` / `codec.decode(streams)` on an `[L, B, T, d]` stack; `codec.encoder(n).encode_layer(i, x)`
+one layer at a time on the model's device (closed-loop deltas); `codec.pack(t)` / `codec.unpack(...)` the host
+half; `rc.Store(stem, model=..., layers=..., codec=...)` to write encoded chunks yourself; `rc.transcode(src, dst,
+codec)` to re-encode a stored capture with another codec or regime; `reader.codec` is the one a file was written
+with. `rescomp.bf16_wrapper.choose_channels(X, spec)` picks outlier channels from a sample offline.
 
 ## Regimes
 
-Four named settings cover the useful range; pass one as `spec=`. Each is a spec template whose group and
+Four named settings cover the useful range; pass one as `codec=`. Each is a spec template whose group and
 outlier counts scale with the model width `d` (resolved when the sink sees its first batch).
 
 | Regime | Spec | Keep in mind |
@@ -162,10 +166,11 @@ tokenizer and forward hooks) live beside it; none of them is part of the library
 | `sink.py` | `Sink`: hooks a running model, encodes each layer in its hook, buffers on the device, flushes to a `Store` |
 | `hooks.py` | `Layers` (what to hook) and `CallHooks` (the forward hooks and the token pre-hook), shared by the Sink and the Patcher |
 | `bindings.py`, `hf.py`, `tl.py` | `ModelBinding` and `bind()`: which modules carry the residual stream, what the header records; Hugging Face (`load_model`, `decoder_blocks`) and TransformerLens bindings |
-| `codec.py` | one stored layer in, named streams out: closed-loop deltas, `Encoder` / `Decoder`, the compiled per-layer function |
+| `codec.py` | `Codec`: how activations are stored. The device half (`encoder()`: closed-loop deltas, the compiled per-layer function) and the host half (`pack`/`unpack`); `to_dict`/`from_header` for the file header |
+| `stage.py` | `Stage`, the root of the codec's parts, with the registry and `stage(kind, name)` factory |
+| `quant.py` | `Quantizer` stages (casts, fp8, int8/int4 groups on torchao, MXFP4, NVFP4), `quantizer(name)` |
+| `lossless.py` | `Lossless` stages (byte-shuffle + zstd), `lossless(record)` |
 | `bf16_wrapper.py` | what the quantizer does not touch: outlier channels and sink rows, kept in bf16, and how they are chosen |
-| `quant.py` | `Quantizer` classes (casts, fp8, int8/int4 groups on torchao, MXFP4, NVFP4) and the `quantizer(name)` factory |
-| `lossless.py` | `Lossless` classes (byte-shuffle + zstd) and the `lossless(record)` factory |
 | `spec.py`, `regimes.py` | spec strings and the four regimes |
 | `store.py` | format 3 on disk or S3: `Store`, `Reader`, `transcode`, `location` |
 | `instrument.py` | the separate regime: `Patcher`, `LiveCodec`, KL / perplexity / per-layer / coherence |

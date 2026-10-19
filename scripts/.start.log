@@ -1,4 +1,2 @@
-box i-02b17b44a3cb0641f up at 35.95.31.3
-NVIDIA A10G, 23028 MiB
-/dev/root       243G  237G  5.9G  98% /
-2.14.0+cu130 True 5.17.0
+
+aws: [ERROR]: An error occurred (InsufficientInstanceCapacity) when calling the StartInstances operation (reached max retries: 2): Insufficient capacity.

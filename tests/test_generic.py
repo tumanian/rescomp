@@ -85,7 +85,7 @@ def test_pipeline_without_transformers(toy, tmp_path, no_transformers):
         assert r.header["layers"][1]["hook"] == {"toy": "blocks.1"} and r.header["model"]["n_layers"] == L
         assert r.n_seq == 10 and r.annotation("doc")[:4] == [0, 1, 2, 3] and r.header["fidelity"]["rel_l2"] > 0
         X = toy.activations(toks[:4], (0, 1, 2))
-        assert torch.equal(torch.stack(r.read(2, [0, 1, 2, 3])), rc.encode(X, r.spec, r.channels)[1][2])
+        assert torch.equal(torch.stack(r.read(2, [0, 1, 2, 3])), rc.Codec(r.spec, channels=r.channels).encode(X)[1][2])
         spec, channels = r.spec, r.channels
     run = lambda t: toy(t)
     assert I.kl_ppl(run, toks, I.Patcher(toy_layers(toy), lambda l, x, s, st: x), batch=4)["kl_mean"] == 0.0

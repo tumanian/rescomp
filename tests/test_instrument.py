@@ -8,7 +8,7 @@ import rescomp as rc
 from rescomp import instrument as I
 from rescomp.hooks import Layers
 from rescomp.sink import Sink
-from tests.test_generic import D, L, V
+from tests.test_generic import L, V
 from tests.test_generic import ToyLM
 from tests.test_sink import layers_of
 

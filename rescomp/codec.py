@@ -1,4 +1,15 @@
-"""Layer codec: turns one stored layer [B, T, d] into named streams and back, layer after layer.
+"""The codec: one object for how activations are stored, lossy or lossless.
+
+    codec = Codec("balanced")                                  # a regime (resolved when the width is known) ...
+    codec = Codec("int4_g96+layerK4+out8", level=5)            # ... or any spec string, with the zstd level
+    codec = Codec("bf16")                                      # lossless for a bf16 model
+    enc = codec.encoder(n_layers); enc.encode_layer(i, x)      # on the model's device, one layer at a time
+    blob, raw = codec.pack(stream)                             # on the host, at flush: byte-shuffle + zstd
+    codec.to_dict()                                            # what the file header records
+
+Inside: a quantizer (rescomp.quant), the closed-loop layer deltas and keyframes (below), the outlier channels and
+sink rows kept exactly (rescomp.bf16_wrapper) and the lossless stage (rescomp.lossless). Which of them run on the
+device and which on the host is this module's business: `encode_layer` is the device half, `pack` the host half.
 
 Order per layer (fp32 throughout):
     v = x                       at keyframes
@@ -10,10 +21,14 @@ Encoder and Decoder run the same reconstruction ops in the same order, so the de
 encoder's xhat. `layer_values` holds the tensor work of one layer with no Python state, so torch.compile can fuse
 it; `_CodecState` holds what carries over between layers of one chunk.
 """
+import json
+
 import torch
 
-from .quant import quantizer
 from .bf16_wrapper import OutlierChannels, check_channels, restore, split
+from .lossless import lossless
+from .quant import CODEC_VERSION, Cast, quantizer
+from .regimes import is_regime, needs_width, resolve
 from .spec import Spec
 
 
@@ -85,11 +100,14 @@ def reconstruct(streams, q, spec, O):
 
 class _CodecState:
     """What carries over from one stored layer to the next within a chunk: the spec, the outlier channels (with
-    a per-device copy of their ids), the previous layer's reconstruction and the next expected layer index."""
+    a per-device copy of their ids), the previous layer's reconstruction and the next expected layer index.
+    Built by Codec.encoder() / Codec.decoder(); the channel ids it chooses go into the codec's record."""
 
-    def __init__(self, spec, channels, n_layers, compile=False):
-        self.spec, self.n_layers, self.compile = Spec.parse(spec), n_layers, compile
-        self.channels = channels if channels is not None else OutlierChannels(None, "none")
+    def __init__(self, codec, n_layers):
+        if codec.spec is None:
+            raise ValueError(f"codec {codec.given!r} needs the model width first: codec.resolve(d)")
+        self.spec, self.n_layers, self.compile = codec.spec, n_layers, codec.compile
+        self.channels = codec.channels if codec.channels is not None else OutlierChannels(None, "none")
         check_channels(self.channels, self.spec, n_layers)
         self.d = None
         self._ids_on = {}
@@ -161,19 +179,94 @@ class Decoder(_CodecState):
         return xhat
 
 
-@torch.no_grad()
-def encode(X, spec, channels=None):
-    """X [L, B, T, d] -> (list of per-layer stream dicts, xhat [L, B, T, d] fp32)."""
-    enc = Encoder(spec, channels, X.shape[0])
-    out, xh = [], []
-    for i in range(X.shape[0]):
-        s, x = enc.encode_layer(i, X[i])
-        out.append(s)
-        xh.append(x)
-    return out, torch.stack(xh)
+class Codec:
+    """How activations are stored. `spec`: a regime name, a spec template or a spec string (or a Spec);
+    `channels`: the outlier channels when the spec keeps some (else chosen on the first call by the Sink, or from
+    a sample by transcode); `lossless`/`level`/`shuffle`: the byte stage; `compile`: torch.compile the per-layer
+    function (fused kernels, same bytes)."""
+
+    def __init__(self, spec="balanced", *, channels=None, lossless="zstd", level=3, shuffle=True, compile=False):
+        self.given = spec.name if isinstance(spec, Spec) else spec
+        self.regime = spec if is_regime(spec) else None
+        self.spec = None if needs_width(spec) else resolve(spec)       # a regime resolves once d is known
+        self.channels = channels
+        self.lossless = _lossless(lossless, level, shuffle)
+        self.compile = compile
+
+    @classmethod
+    def from_header(cls, header):
+        """The codec a file was written with (header: the meta row with the JSON fields decoded or not)."""
+        def field(k):
+            v = header[k]
+            return json.loads(v) if isinstance(v, str) else v
+        c = cls(header["spec"], channels=OutlierChannels.from_dict(field("outlier_channels")), lossless=field("lossless"))
+        c.regime = header.get("regime")
+        return c
+
+    # -- the spec
+    def resolve(self, d):
+        """Fix the width-dependent sizes of a regime or template (idempotent) -> Spec."""
+        if self.spec is None:
+            self.spec = resolve(self.given, d)
+        return self.spec
+
+    @property
+    def lossy(self):
+        """False when every layer is a plain cast (fp32 / bf16 / fp16: exact for bf16 activations in range)."""
+        spec = self.spec if self.spec is not None else resolve(self.given, 1 << 20)
+        return not all(isinstance(quantizer(spec.quant_for(i)), Cast) for i in range(max(2, spec.K or 2)))
+
+    # -- the device half: tensors in, streams of codes and scales out
+    def encoder(self, n_layers):
+        """A fresh per-chunk encoder: encode_layer(i, x) for i = 0, 1, ... in storage order."""
+        return Encoder(self, n_layers)
+
+    def decoder(self, n_layers):
+        return Decoder(self, n_layers)
+
+    @torch.no_grad()
+    def encode(self, X):
+        """X [L, B, T, d] -> (list of per-layer stream dicts, xhat [L, B, T, d] fp32)."""
+        enc = self.encoder(X.shape[0])
+        out, xh = [], []
+        for i in range(X.shape[0]):
+            s, x = enc.encode_layer(i, X[i])
+            out.append(s)
+            xh.append(x)
+        return out, torch.stack(xh)
+
+    @torch.no_grad()
+    def decode(self, streams):
+        dec = self.decoder(len(streams))
+        return torch.stack([dec.decode_layer(i, s) for i, s in enumerate(streams)])
+
+    # -- the host half: a stream tensor <-> compressed bytes
+    def pack(self, t):
+        """tensor -> (compressed bytes, raw byte count)."""
+        return self.lossless.compress(t)
+
+    def unpack(self, blob, dtype, shape, raw_nbytes):
+        return self.lossless.decompress(blob, dtype, shape, raw_nbytes)
+
+    # -- the header
+    def to_dict(self):
+        return {"version": CODEC_VERSION, "spec": self.spec.name if self.spec is not None else self.given,
+                "regime": self.regime, "outlier_channels": (self.channels or OutlierChannels(None, "none")).to_dict(),
+                "lossless": self.lossless.to_dict()}
+
+    def __repr__(self):
+        return f"Codec({self.given!r}{', lossy' if self.lossy else ', lossless'}, {self.lossless!r})"
 
 
-@torch.no_grad()
-def decode(streams, spec, channels=None):
-    dec = Decoder(spec, channels, len(streams))
-    return torch.stack([dec.decode_layer(i, s) for i, s in enumerate(streams)])
+def as_codec(x):
+    """A Codec, a spec string / Spec / regime name -> Codec."""
+    return x if isinstance(x, Codec) else Codec(x)
+
+
+def _lossless(backend, level, shuffle):
+    if isinstance(backend, (str, dict)) or backend is None:
+        rec = {"codec": backend or "zstd"} if not isinstance(backend, dict) else dict(backend)
+        if isinstance(backend, dict):
+            return lossless(rec)
+        return lossless(rec, level=level, shuffle=shuffle)
+    return lossless(backend)

@@ -35,7 +35,7 @@ def test_bind_and_forward(tiny_model, fake_tok, tmp_path):
     with rc.open(str(tmp_path / "hf")) as r:
         assert r.n_seq == 5 and r.header["n_chunks"] == 2
         assert torch.equal(torch.stack(r.tokens()), toks) and r.attention_mask(4).tolist() == [1] * 7 + [0] * 3
-        exp = rc.encode(hidden(tiny_model, toks[:3], [1, 3]), r.spec, r.channels)[1]   # the encoder saw the fp32 activations
+        exp = rc.Codec(r.spec, channels=r.channels).encode(hidden(tiny_model, toks[:3], [1, 3]))[1]   # the encoder saw the fp32 activations
         assert torch.equal(torch.stack(r.read(3, [0, 1, 2])), exp[1])
     with pytest.raises(ValueError):
         rc.bind(tiny_model, [9])
@@ -56,7 +56,7 @@ def test_generate_with_kv_cache(tiny_model, fake_tok, tmp_path):
         x = r.read(3, 0)
         assert x.shape == (8, 64)
         # the stored prefill part is exactly the encoding of a one-shot run of the prompt
-        exp_prompt = rc.encode(hidden(tiny_model, prompt, [0, 2, 3]), r.spec)[1]
+        exp_prompt = rc.Codec(r.spec).encode(hidden(tiny_model, prompt, [0, 2, 3]))[1]
         assert torch.equal(r.read(0, 0)[:4], exp_prompt[0, 0]) and torch.equal(r.read(3, 1)[:4], exp_prompt[2, 1])
 
 

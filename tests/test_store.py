@@ -8,6 +8,7 @@ import pytest
 import torch
 
 import rescomp as rc
+from rescomp.bf16_wrapper import choose_channels
 from rescomp import store as S
 from tests.conftest import make_acts
 
@@ -26,13 +27,13 @@ def write_store(stem, spec="int4_g16+layerK2+out2", rotate_bytes=4 << 30, chunks
     acts = make_acts(L=4, B=N, T=8, d=64, seed=3)
     tokens = torch.randint(0, 50000, (N, 8))
     spec = rc.Spec.parse(spec)
-    cal = rc.choose_channels(acts[:, :4], spec)
+    cal = choose_channels(acts[:, :4], spec)
     expect = []
-    with S.Store(stem, model=MODEL, layers=LAYERS, spec=spec, channels=cal, rotate_bytes=rotate_bytes,
+    with S.Store(stem, model=MODEL, layers=LAYERS, codec=rc.Codec(spec, channels=cal), rotate_bytes=rotate_bytes,
                  hook_names={8: {"hf": "transformer.h.8"}}, extra={"note": "x"}) as st:
         for a, n in chunks:
             X = acts[:, a: a + n]
-            streams, xh = rc.encode(X, spec, cal)
+            streams, xh = rc.Codec(spec, channels=cal).encode(X)
             ids = [st.new_sequence(tokens[a + j], mask=[1] * 8, doc_id=10 * (a + j), tag=f"s{a + j}",
                                    vec=np.arange(3) + a + j) for j in range(n)]
             st.add_chunk(ids, [0] * n, streams, err_rows(X, xh))
@@ -88,12 +89,12 @@ def test_sequence_spanning_chunks(tmp_path):
     spec = rc.Spec.parse("int8_tok+layerK2")
     full = make_acts(L=4, B=2, T=6, d=64, seed=5)
     toks = torch.arange(12).reshape(2, 6)
-    with S.Store(stem, model=MODEL, layers=LAYERS, spec=spec) as st:
+    with S.Store(stem, model=MODEL, layers=LAYERS, codec=spec) as st:
         ids = [st.new_sequence(toks[j, :3]) for j in range(2)]          # prompt: 3 tokens
         parts = []
         for a, b in [(0, 3), (3, 4), (4, 5), (5, 6)]:
             X = full[:, :, a:b]
-            streams, xh = rc.encode(X, spec)
+            streams, xh = rc.Codec(spec).encode(X)
             st.add_chunk(ids, [a, a], streams, err_rows(X, xh))
             st.note_raw(X.numel() * 2, 64)
             if a > 0:
@@ -117,14 +118,14 @@ def test_sequence_spanning_chunks(tmp_path):
 def test_tokens_optional_and_ragged(tmp_path):
     stem = str(tmp_path / "rag")
     spec = rc.Spec.parse("bf16")
-    with S.Store(stem, model=MODEL, layers=LAYERS, spec=spec) as st:
+    with S.Store(stem, model=MODEL, layers=LAYERS, codec=spec) as st:
         a = st.new_sequence()                                           # no tokens recorded
         b = st.new_sequence([1, 2, 3])
         X = make_acts(L=4, B=1, T=5, d=64)
-        streams, xh = rc.encode(X, spec)
+        streams, xh = rc.Codec(spec).encode(X)
         st.add_chunk([a], [0], streams, err_rows(X, xh))
         X2 = make_acts(L=4, B=1, T=3, d=64, seed=9)
-        streams, xh2 = rc.encode(X2, spec)
+        streams, xh2 = rc.Codec(spec).encode(X2)
         st.add_chunk([b], [0], streams, err_rows(X2, xh2))
         st.note_raw(0, 64)
     with S.Reader(stem) as r:
@@ -137,10 +138,10 @@ def test_tokens_optional_and_ragged(tmp_path):
 
 def test_store_validation(tmp_path):
     with pytest.raises(ValueError):
-        S.Store(str(tmp_path / "x"), model=MODEL, layers=[], spec="bf16")
+        S.Store(str(tmp_path / "x"), model=MODEL, layers=[], codec="bf16")
     with pytest.raises(TypeError):
-        S.Store(str(tmp_path / "x"), model=MODEL, layers=LAYERS, spec="bf16", extra={"a": np.int64(1)})
-    st = S.Store(str(tmp_path / "y"), model=MODEL, layers=LAYERS, spec="bf16")
+        S.Store(str(tmp_path / "x"), model=MODEL, layers=LAYERS, codec="bf16", extra={"a": np.int64(1)})
+    st = S.Store(str(tmp_path / "y"), model=MODEL, layers=LAYERS, codec="bf16")
     with pytest.raises(ValueError):
         st.add_chunk([0], [0], [{}], [])
     st.close()
@@ -197,9 +198,9 @@ def test_transcode(tmp_path):
         assert torch.equal(torch.stack(r.tokens()), tokens) and r.annotation("doc_id") == [10 * i for i in range(10)]
         assert r.header["outlier_channels"]["source"].startswith("first ")
         for a, n in ((0, 3), (3, 5), (8, 2)):              # chunk-wise re-encoding with the file's own outlier channels
-            exp = rc.encode(acts[:, a: a + n], spec, r.channels)[1]
+            exp = rc.Codec(spec, channels=r.channels).encode(acts[:, a: a + n])[1]
             assert torch.equal(torch.stack(r.read(9, list(range(a, a + n)))), exp[1])
     rc.transcode(src, str(tmp_path / "x"), "compact")
     assert rc.open(str(tmp_path / "x")).spec.name == "int4_g8+layerK4+out8"
-    with pytest.raises(ValueError):
-        rc.Store(str(tmp_path / "z"), model=MODEL, layers=LAYERS).add_chunk([0], [0], [{}] * 4, None)
+    with pytest.raises(ValueError, match="resolve"):            # a regime needs the width before the first chunk
+        rc.Store(str(tmp_path / "z"), model=MODEL, layers=LAYERS, codec="balanced").add_chunk([0], [0], [{}] * 4, None)

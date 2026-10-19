@@ -39,10 +39,11 @@ def cmd_capture(a):
     from corpus import wikitext_sequences          # beside this file
     from rescomp.hf import load_model
     from rescomp.bindings import bind
+    from rescomp.codec import Codec
     from rescomp.sink import Sink
     model, tok = load_model(a.model, dtype=a.dtype, revision=a.revision, attn_implementation=a.attn)
     tokens = wikitext_sequences(tok, a.n_seq, a.seq_len, seed=a.seed, bos=a.bos)
-    with Sink(a.out, bind(model, a.layers, tokenizer=tok, model_id=a.model, revision=a.revision), a.spec, level=a.level,
+    with Sink(a.out, bind(model, a.layers, tokenizer=tok, model_id=a.model, revision=a.revision), Codec(a.spec, level=a.level),
               fidelity=a.fidelity) as sink, torch.no_grad():
         for i in range(0, a.n_seq, a.batch):
             model(tokens[i: i + a.batch].to(sink.layers.root.get_input_embeddings().weight.device), use_cache=False)
