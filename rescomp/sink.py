@@ -104,16 +104,25 @@ class Sink:
         return s
 
     def close(self):
+        """Take the hooks off, write what is buffered and finish the capture."""
         self.hooks.detach()
         self._write_buffer()
         self.store.close()
+
+    def discard(self):
+        """Take the hooks off and stop without writing: the buffered calls are dropped and the stem reads as it did
+        after the last flush (or holds no capture at all). What `with` does when its body raises, so a run that
+        fails (the exact check, an OOM, an interrupt) never leaves a capture that looks complete."""
+        self.hooks.detach()
+        self._buffer, self._buffered = [], 0
+        self.store.discard()
 
     def __enter__(self):
         self.hooks.attach()
         return self
 
-    def __exit__(self, *exc):
-        self.close()
+    def __exit__(self, exc_type, *_):
+        (self.close if exc_type is None else self.discard)()
 
     # -- per hooked layer, inside the model's forward
     def _on_layer(self, l, x, call):

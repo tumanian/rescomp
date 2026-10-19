@@ -16,6 +16,8 @@ A flush writes only what is new since the last one (one part per table), then re
 last and atomically (a temporary file renamed into place locally, one PUT on S3). A reader takes the parts the
 meta table counts and ignores anything newer, so a flush that fails part-way leaves the previous flush's capture
 intact, a capture is readable mid-run, and the cost of a flush grows with what it adds, not with the capture.
+A `with` body that raises discards what was not flushed (Store.discard): the stem reads as it did after the last
+flush, or holds no capture at all, never a half capture that looks complete.
 
 A stem that already holds a capture is refused unless `overwrite=True`, which removes the old files first.
 Annotation names cannot be the structural columns (seq_id, n_tokens, tokens, mask). The header records a local
@@ -441,17 +443,30 @@ class Store:
                            for i, l in enumerate(self.layers)}, "files": self.blobs.files}
 
     def close(self):
+        """Publish what is left and finish."""
         if self.closed:
             return
         self.flush()
         self.blobs.close()
         self.closed = True
 
+    def discard(self):
+        """Stop without publishing: the stem reads as it did after the last flush, or holds no capture at all if
+        nothing was flushed (stray blob files are removed). What `with` does when its body raises, so a failed run
+        never leaves a capture that looks complete."""
+        if self.closed:
+            return
+        self.blobs.close()
+        if not self.loc.exists(table_path(self.loc, "meta")):
+            for p in capture_files(self.loc):
+                self.loc.fs.delete_file(p)
+        self.closed = True
+
     def __enter__(self):
         return self
 
-    def __exit__(self, *exc):
-        self.close()
+    def __exit__(self, exc_type, *_):
+        (self.close if exc_type is None else self.discard)()
 
 
 # ---------------------------------------------------------------- reader

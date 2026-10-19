@@ -14,7 +14,8 @@ whose layers are `nn.Module`s.
 pip install -e .            # torch>=2.8, numpy, zstandard, pyarrow, torchao
 pip install -e '.[hf]'      # + transformers
 pip install -e '.[scripts]' # + datasets, for the scripts/ study and CLI
-pytest                      # 162 tests in about 10 s on a CPU (2 need CUDA or TransformerLens); ruff check .
+pip install -e '.[test]'    # + pytest, moto (the S3 tests), ruff
+pytest                      # 164 tests in about 10 s on a CPU (2 need CUDA or TransformerLens); ruff check .
 ```
 
 ## Use
