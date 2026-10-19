@@ -134,7 +134,7 @@ outlier counts scale with the model width `d` (resolved when the sink sees its f
 
 | Regime | Spec | Keep in mind |
 |---|---|---|
-| `exact` | `fp16` | bit-exact for bf16 models whose values fit fp16's range; the Sink checks every call and raises otherwise (`bf16` is exact for any bf16 model, at a lower ratio) |
+| `exact` | `fp16` | bit-exact for bf16 models whose values fit fp16's range; the Sink checks every call and raises otherwise. Gemma-2-2B, Gemma-2-9B and Qwen3-8B have residual values above 65504, so for them use `bf16` (exact for any bf16 model, at a lower ratio) |
 | `faithful` | `int8_tok+out8` | every layer at single-layer KL ≈ 0.001 |
 | `balanced` | `int4_g(d/8)+layerK4+out(d/128)+key=bf16` | every 4th layer stored exactly; the rest at KL ≤ 0.005 |
 | `compact` | `int4_g(d/8)+layerK4+out(d/128)` | the 5× point; small models pay more |
