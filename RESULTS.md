@@ -6,9 +6,12 @@ and `scripts/report.py`; the raw records (`results/<model>/results.jsonl`, gener
 
 ## Setup
 
-*Codec note: these numbers were measured with codec version 1 (the library's own quantizers). Codec version 2
-pins the int-group, MXFP4 and NVFP4 paths to torchao; its int grid is torchao's no-clipping symmetric one, which
-matches version 1 on this kind of data (see `tests/test_quant.py`), so ratios and errors carry over within noise.*
+*Codec note: these numbers were measured with codec version 1 (the library's own quantizers). Codec version 3
+pins the int-group, MXFP4 and NVFP4 paths to torchao (no-clipping symmetric int grid, torchao's nibble packing)
+and drops `uabs`. Re-measured on GPT-2 (2026-10-19, same data and layers): `exact` 1.51×, `faithful`
+`int8_tok+out8` 2.42× at live KL 0.0217 / ppl ×1.0035, `compact` `int4_g96+layerK4+out8` 4.59× at live KL 0.047 /
+ppl ×1.028 (was 4.70× / 0.050 / ×1.029), per-layer KL 0.029 keyframe / 0.037 delta, coherence ×1.06 (t 1.5).
+The ratio of the int4 rows is about 2% lower under codec 3 (the packing compresses slightly less); errors are the same.*
 
 - **Models** (bf16, Hugging Face): GPT-2 small (12 layers, d = 768), Qwen3-1.7B (28 layers, d = 2048),
   Gemma-2-2B (26 layers, d = 2304, eager attention, BOS-first windows), Qwen3-8B (36 layers, d = 4096); then, as

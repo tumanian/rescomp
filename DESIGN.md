@@ -1,13 +1,13 @@
 # Design: the sink
 
-Decisions taken 2026-10-18, built the same day (`rescomp/sink.py`, `rescomp/store.py`, `rescomp/instrument.py`). This replaces the "capture wraps the model" API: the production flow is
+Decisions taken 2026-10-18, built the same day; module layout reworked 2026-10-19 (see the end). This replaces the "capture wraps the model" API: the production flow is
 *initialize once (hooks), run the model untouched, look at what is stored*. Instrumentation (patching
 reconstructions back into a model, KL, coherence) is a separate regime and must not leak into it.
 
 ## Production flow
 
 ```python
-rec = rc.Sink("run1", layers=rc.hf_layers(model, [8, 9, 10, 11]),   # module objects to hook; helpers for HF/TL
+rec = rc.Sink("run1", layers=rc.bind(model, [8, 9, 10, 11]),         # module objects to hook; HF/TL detected
                   spec="int4_g384+layerK4+out12",
                   tokens=None)                                             # None: a pre-hook captures input ids
 with rec:                                   # registers forward hooks on the given modules
@@ -18,7 +18,8 @@ rec.stats()                                 # chunks, sequences, bytes, ratio, p
 ```
 
 - **Hooks attach to plain `nn.Module` objects.** Any module whose output is the residual stream: Hugging Face
-  decoder blocks, TransformerLens hook points, custom models. `rc.hf_layers` / `rc.tl_layers` only pick modules.
+  decoder blocks, TransformerLens hook points, custom models. `rc.bind` only picks modules: a `ModelBinding` per
+  framework says which modules carry the residual stream and what the header records; `{layer: module}` for the rest.
 - **Tokens are optional.** Given explicitly (`rec.tokens(ids)` before a forward, or `tokens=` at init for a fixed
   set) or, when not given, taken by a forward pre-hook on the top-level model (`input_ids` keyword or first
   positional argument; a one-line extractor for custom models). The attention mask is taken the same way.
@@ -27,8 +28,8 @@ rec.stats()                                 # chunks, sequences, bytes, ratio, p
   with the forward pass; each layer's hook runs it as the layer is produced and keeps the encoded streams
   (2-4x smaller than raw) on the device. zstd and the file writes happen at `flush()`, which first moves the
   streams to the host (forced by an on-device buffer limit, 1 GiB default, and at close). Budget: under 1% of
-  forward latency; `scripts/sink_overhead.py` measures latency and peak GPU memory. Outlier calibration uses
-  the first call, per layer, in each layer's hook.
+  forward latency; `scripts/sink_overhead.py` measures latency and peak GPU memory. Outlier channels are chosen on
+  the first call, per layer, in each layer's hook (`bf16_wrapper.py`).
 - **File rotation at a size limit**, large (default 4 GB per tensor file): `run1.00000.rsc`, `run1.00001.rsc`, ...
   The index records which file each blob lives in.
 - **Generation is handled on read, not on write.** With the KV cache each step yields `[B, 1, d]`. Every chunk
@@ -37,28 +38,29 @@ rec.stats()                                 # chunks, sequences, bytes, ratio, p
   arguments by the pre-hook). Each call is encoded on its own (small one-token blobs compress ~10-20% worse than a merged
   sequence would); the reader concatenates. Sequence length is per chunk.
 
-## Storage layout (format version 2)
+## Storage layout (format version 3)
 
 Tensors and metadata are separated:
 
 | File | Contents |
 |---|---|
 | `run1.<n>.rsc` | only the compressed tensor blobs (codes, scales, outliers, sink rows), one blob per (chunk, layer, stream), concatenated; a magic and a format version at the front |
-| `run1.meta.parquet` | one row: format version, library version, created, model info (JSON), spec, calibration (JSON), lossless settings, site, stored layers with hook names and measured fidelity (JSON) |
+| `run1.meta.parquet` | one row: format version, library version, created, model info (JSON), spec, outlier channels (JSON), lossless settings, site, stored layers with hook names and measured fidelity (JSON) |
 | `run1.blobs.parquet` | one row per blob: chunk, sequence id, start position, n_tokens, layer, stream, file number, offset, nbytes, raw_nbytes, crc32, dtype, shape |
 | `run1.tokens.parquet` | one row per sequence: seq id, n_tokens, token ids (list<int32>), attention mask (list<uint8>, optional), and every annotation as its own column (scalars as plain columns, per-token arrays as list columns, per-layer routing as list columns) |
 
 Why: the per-sequence table is directly queryable (pandas, DuckDB, Polars) without touching the tensors, tokens
 and labels live next to each other, and the tensor file stays a dumb append-only stream that rotation can cut.
-`rc.Reader` opens the set by its stem and keeps today's API (`read`, `read_stack`, `tokens`, `annotation`).
-Dependency: `pyarrow`.
+`rc.Reader` opens the set by its stem (`read`, `read_padded`, `tokens`, `attention_mask`, `annotation`).
+Dependency: `pyarrow`. Format 3 (2026-10-19) is format 2 with codec 3 (torchao-pinned quantizers, `uabs` gone);
+the reader names a mismatched format or codec version instead of guessing.
 
 ## Instrumentation regime (separate)
 
 `rescomp.instrument`: a `Patcher` that hooks the same modules and replaces their outputs with reconstructions
 (from a file, or live through the encoder), plus the measurements that exist today (file / per-layer / live KL,
-perplexity ratio, generation coherence). Uses the same module-object convention as the sink; the
-`ModelAdapter` protocol goes away once this exists.
+perplexity ratio, generation coherence). Uses the same module-object convention as the sink, through the same
+`CallHooks` (`hooks.py`); it runs over any `run(tokens) -> logits` callable.
 
 ## Measured overhead (A10G, 2026-10-18)
 
@@ -81,15 +83,34 @@ the fp32 cast, the delta), or write the quantizer as one Triton kernel.
 
 ## Bytes and devices
 
-The codec (version 2) is pinned to torchao's numerics. Encoding the same activations on a GPU and on the CPU gives
-identical bytes for the plain casts, int8, uabs, mxfp4 and int4 keyframes, and can differ in the last bit for
+The codec (version 3) is pinned to torchao's numerics. Encoding the same activations on a GPU and on the CPU gives
+identical bytes for the plain casts, int8, mxfp4 and int4 keyframes, and can differ in the last bit for
 nvfp4 and for delta layers (reciprocal scales and accumulation order). Every file is self-consistent: decoding on
-any device returns exactly the reconstruction the encoder computed on the device that wrote it.
+any device returns exactly the reconstruction the encoder computed on the device that wrote it. The compiled
+per-layer function (`compile=True`) gives the same bytes as eager: inductor is told to emulate the fp16 casts of
+scales and codes (`emulate_precision_casts`), since by default it keeps fused intermediates in fp32.
 
 ## Status
 
-Built as designed: defaults are 4 GB rotation and 2 GB staging buffer; the offline mode encodes on flush only;
-`rc.open()` reads both the format-2 stem and the single-file RSC1 format. Not done: a background encoder thread; object storage. The store writes to the local disk only. S3 would fit the
-layout (each rotated tensor file is immutable once closed and could be uploaded at rotation; the Parquet tables
-are small whole-file rewrites; the reader's blob fetches are offset-plus-length reads, i.e. range requests), via
-pyarrow's filesystem layer. Until then: write locally, sync the stem's files afterwards.
+Built as designed: 4 GiB rotation locally, 1 GiB on S3, a 1 GiB on-device buffer; S3 through pyarrow's filesystem
+layer (each flush closes the current object; the reader fetches blobs with range requests). The single-file RSC1
+reader is gone. Not done: a background encoder thread; the sub-1% overhead work (CUDA graphs for fixed shapes).
+
+## Module layout (2026-10-19)
+
+The library was reworked in six small commits that kept bytes and numbers intact (checked by the golden hashes,
+the suite on x86 and GPU, `scripts/spot_check.py` on a real GPT-2 capture and a re-run of the GPT-2 study row):
+
+- `hooks.py`: `Layers` and `CallHooks`, the forward hooks and the token pre-hook, shared by `Sink` and `Patcher`.
+- `bindings.py`: `ModelBinding` (`blocks`, `root`, `hook_name`, `info`, `extract_tokens`, `moe_layers`) with
+  `HuggingFaceBinding` (`hf.py`), `TransformerLensBinding` (`tl.py`), `ModuleBinding` and the `bind()` factory
+  that picks one by the model's type without importing a framework that is not installed.
+- `codec.py`: the per-layer tensor work is one function (`layer_values`, compilable), the checks are functions
+  (`check_layer_index`, `check_order`, `check_width`), `_CodecState` is what carries over between layers.
+- `bf16_wrapper.py`: outlier channels and sink rows (`OutlierChannels`, `choose_channels`, `split`, `restore`),
+  with the explanation of why they are kept exactly.
+- `quant.py`: `Quantizer` subclasses and `quantizer(name)`; `lossless.py`: `Lossless` subclasses and `lossless()`.
+  `uabs` was dropped (not a regime).
+- `store.py`: also holds `Location` / `location` (local or S3); `check_layers`, `check_streams`;
+  `transcode(sample_seqs=)` picks the outlier channels on the first sequences of the source.
+- `scripts/`: the CLI, the wikitext corpus helper, the study, overhead/profile and spot-check scripts.

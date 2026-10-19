@@ -12,8 +12,9 @@ whose layers are `nn.Module`s.
 
 ```bash
 pip install -e .            # torch>=2.8, numpy, zstandard, pyarrow, torchao
-pip install -e '.[hf]'      # + transformers, datasets
-pytest                      # ~210 tests, CPU only, under a minute
+pip install -e '.[hf]'      # + transformers
+pip install -e '.[scripts]' # + datasets, for the scripts/ study and CLI
+pytest                      # ~155 tests, CPU only, under a minute
 ```
 
 ## Use
@@ -26,7 +27,7 @@ tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
 model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-8B", dtype=torch.bfloat16).cuda().eval()
 batch = tok(["The history of the Roman Empire", "To make a tomato sauce, first"], return_tensors="pt", padding=True).to("cuda")
 
-sink = rc.Sink("runs/demo", layers=rc.hf_layers(model, [24, 28, 32, 35]),
+sink = rc.Sink("runs/demo", layers=rc.bind(model, [24, 28, 32, 35], tokenizer=tok),
                spec="balanced")                                           # a regime, or any spec string
 with sink, torch.no_grad():
     logits = model(**batch).logits                 # one forward call = one chunk
@@ -39,9 +40,10 @@ x = r.read(32, seqs=[2, 3])                        # each sequence whole, [T_i, 
 r.tokens(2); r.header["model"]; r.header["layers"][1]["fidelity"]
 ```
 
-- `layers`: `rc.hf_layers(model, [...])` for Hugging Face, `rc.tl_layers(model, [...])` for TransformerLens, or
-  any `{layer: nn.Module}` whose outputs are the residual stream (then pass `rc.Layers(modules=..., root=model)`
-  if you want the token pre-hook).
+- `layers`: `rc.bind(model, [...])` recognises Hugging Face and TransformerLens models by type (`ModelBinding`
+  subclasses in `hf.py` / `tl.py`; the framework is imported only when present). Any other model:
+  `rc.bind({layer: module, ...}, root=model)` with the modules whose outputs are the residual stream (`root` gets
+  the token pre-hook).
 - Each layer's hook quantizes that layer on the model's device (cheap kernels) and keeps the encoded streams
   there; the model frees its activations as usual. `sink.flush()` moves the streams to the host, runs zstd and
   writes; it is forced when the on-device buffer passes `buffer_bytes` (1 GiB default) and at close.
@@ -52,9 +54,10 @@ r.tokens(2); r.header["model"]; r.header["layers"][1]["fidelity"]
   signal that tells a generation step from a new prompt); `sink.tokens(ids)` overrides, `tokens="off"` disables.
 - `sink.annotate(doc_id=[...], split="train")` labels the sequences the next new-sequence call starts; labels become
   Parquet columns.
-- Outlier channels (`+out`) are calibrated on the first chunk unless `calib=` is given.
+- Outlier channels (`+out`) are chosen per layer on the first forward call unless `channels=` is given
+  (`bf16_wrapper.py` explains what they are and why they are kept exactly).
 
-### Storage (format 2), local or S3
+### Storage (format 3), local or S3
 
 A capture lives under a stem: a local path (`runs/demo`), an `s3://bucket/prefix/demo` URI, or a name with
 `bucket=` and `prefix=`; `Sink`, `Store`, `rc.open`/`Reader` and `rc.transcode` all take these. S3 goes through
@@ -69,14 +72,15 @@ r = rc.open("s3://my-acts/team/qwen3-8b/demo")
 ```
 
 `<stem>.00000.rsc, ...` hold only the compressed tensor blobs (append-only, rotated at `rotate_bytes`, 4 GB by
-default). `<stem>.meta.parquet` has the model, spec, calibration, stored layers with hook names and measured
+default). `<stem>.meta.parquet` has the model, spec, outlier channels, stored layers with hook names and measured
 fidelity, and byte counts; `<stem>.chunks.parquet` which sequences each chunk holds and where; `<stem>.blobs.parquet`
 one row per blob (byte range, crc, dtype, shape); `<stem>.tokens.parquet` one row per sequence (tokens, mask,
 annotations).
 
 ### Lower level
 
-`rc.encode(X, spec, calib)` / `rc.decode(streams, spec, calib)` on an `[L, B, T, d]` stack; `rc.Encoder(...)
+`rc.encode(X, spec, channels)` / `rc.decode(streams, spec, channels)` on an `[L, B, T, d]` stack
+(`rc.choose_channels(X, spec)` picks the outlier channels from a sample); `rc.Encoder(...)
 .encode_layer(i, x)` one layer at a time (closed-loop deltas); `rc.Store` to write encoded chunks yourself;
 `rc.transcode(src, dst, spec)` to re-encode a stored capture with another spec or regime.
 
@@ -108,6 +112,11 @@ late third of layers, wikitext; details and per-layer numbers in `RESULTS.md`):
 
 ![Four regimes on eight models](docs/regimes.png)
 
+The table and chart are the study's numbers (codec version 1, the library's own quantizers). Codec 3 pins the
+int-group, MXFP4 and NVFP4 paths to torchao; re-measured on GPT-2 it gives `compact` 4.6× / +2.8% (torchao's
+nibble packing compresses about 2% less under zstd), `faithful` 2.4× / +0.4% (was +0.1%; the difference is
+within the noise of a bf16 forward), `exact` and `balanced` unchanged.
+
 ## Specs
 
 Anything beyond the four regimes is a spec string: `<quant>[+layerK<K>][+out<n>][+sink<s>][+key=<quant>]`
@@ -117,15 +126,14 @@ Anything beyond the four regimes is a spec string: `<quant>[+layerK<K>][+out<n>]
 | `fp32`, `bf16`, `fp16` | plain casts (bf16 is lossless for a bf16 model; fp16 too, at 1.5×), then byte-shuffle + zstd |
 | `fp8_e4m3`, `int8_tok` | 8-bit codes with one fp16 scale per token |
 | `int4_g<G>`, `int8_g<G>` | torchao affine codes (symmetric, no clipping, full range) with one fp16 scale per group of G channels (G must divide d) |
-| `uabs<step>` | fixed step in activation units; zigzag integer codes in byte planes, so zstd does the entropy coding |
 | `mxfp4`, `nvfp4` | torchao's OCP MX / NVIDIA FP4: e2m1 codes with an e8m0 scale per 32 or an e4m3 scale per 16 channels |
 | `+layerK<K>` | code stored layer i as `x_i - xhat_{i-1}` except every K-th layer (closed loop, so errors do not accumulate) |
-| `+out<n>` | keep the n highest-energy channels of each layer in bf16 (calibrated; stored in the header) |
+| `+out<n>` | keep the n highest-energy channels of each layer in bf16 (chosen on the first call; stored in the header) |
 | `+sink<s>` | keep the first s tokens of every sequence in bf16 |
 | `+key=<quant>` | hybrid: keyframe layers use this quantizer (`key=bf16` keeps every K-th layer exact) |
 
-Beyond the regimes, `uabs(0.1·rms)+out8` is worth knowing: 3.0× at ≤ 0.6% perplexity with no exact layers
-(the step must be set from the activations' rms). `nvfp4+layerK4+out8` gives 3.7× at +0.5–2%.
+Beyond the regimes, `nvfp4+layerK4+out8` gives 3.7× at +0.5–2%. The study's `uabs` (fixed-step) codec is not in
+the library: it was not one of the four regimes, and its numbers stay in RESULTS.md for reference.
 
 ## Instrumentation (separate from the sink)
 
@@ -134,7 +142,7 @@ module-object convention and any `run(tokens) -> logits` callable:
 
 ```python
 from rescomp import instrument as I
-L = rc.hf_layers(model, [24, 28, 32, 35])
+L = rc.bind(model, [24, 28, 32, 35])
 run = lambda t: model(t, use_cache=False).logits
 I.kl_ppl(run, tokens, I.Patcher(L, I.LiveCodec("int4_g512+layerK4+out32")))   # codec inside the forward pass
 I.kl_ppl(run, tokens, I.Patcher(L, rc.open("runs/demo")), seq_ids=range(64))  # stored reconstructions
@@ -143,4 +151,21 @@ I.coherence(run, prompts, I.Patcher(L, I.LiveCodec(spec)), tokenizer=tok)       
 ```
 
 `scripts/run_models.py` runs the study in RESULTS.md with these pieces (capture once with the `exact` regime,
-`rc.transcode` to each spec, then the measurements).
+`rc.transcode` to each spec, then the measurements). `scripts/cli.py` (`info`, `capture`, `eval`),
+`scripts/corpus.py` (wikitext windows) and `scripts/spot_check.py` (a real GPT-2 capture checked against the
+tokenizer and forward hooks) live beside it; none of them is part of the library.
+
+## Layout
+
+| Module | What it holds |
+|---|---|
+| `sink.py` | `Sink`: hooks a running model, encodes each layer in its hook, buffers on the device, flushes to a `Store` |
+| `hooks.py` | `Layers` (what to hook) and `CallHooks` (the forward hooks and the token pre-hook), shared by the Sink and the Patcher |
+| `bindings.py`, `hf.py`, `tl.py` | `ModelBinding` and `bind()`: which modules carry the residual stream, what the header records; Hugging Face (`load_model`, `decoder_blocks`) and TransformerLens bindings |
+| `codec.py` | one stored layer in, named streams out: closed-loop deltas, `Encoder` / `Decoder`, the compiled per-layer function |
+| `bf16_wrapper.py` | what the quantizer does not touch: outlier channels and sink rows, kept in bf16, and how they are chosen |
+| `quant.py` | `Quantizer` classes (casts, fp8, int8/int4 groups on torchao, MXFP4, NVFP4) and the `quantizer(name)` factory |
+| `lossless.py` | `Lossless` classes (byte-shuffle + zstd) and the `lossless(record)` factory |
+| `spec.py`, `regimes.py` | spec strings and the four regimes |
+| `store.py` | format 3 on disk or S3: `Store`, `Reader`, `transcode`, `location` |
+| `instrument.py` | the separate regime: `Patcher`, `LiveCodec`, KL / perplexity / per-layer / coherence |
