@@ -55,6 +55,24 @@ and labels live next to each other, and the tensor file stays a dumb append-only
 Dependency: `pyarrow`. Format 3 (2026-10-19) is format 2 with codec 3 (torchao-pinned quantizers, `uabs` gone);
 the reader names a mismatched format or codec version instead of guessing.
 
+## Pooled rows for probes (2026-10-19)
+
+Decided with the user: a `TransformSink` subclass of `Sink` for probes, which need one vector per sequence. The
+`Sink` keeps two extension points on its hook side: `_layer_step` (one layer's activation -> what the call keeps;
+the Sink encodes here) and `_call_step` (a complete call -> what goes into the buffer; the Sink buffers one chunk
+per call). `_on_layer` / `_complete_call` stay fixed: the call record, the dropped-layer rule and the
+new-vs-continued sequence decision are shared. The `TransformSink` overrides the two: its `_layer_step` runs a
+`Transform` (`transforms.py`: `Mean` = mask-weighted mean over real tokens, `Last` = last real token, stacked as
+`"mean+last"`, k = 2 rows, registered Stage kind "transform") on the device; its `_call_step` skips a
+continuation call (the rows describe the prompt; the sink keeps no state across calls) and otherwise registers the
+sequences and appends the `[B, k, d]` rows to a per-layer accumulator. When `chunk_seqs` (4096) sequences are in,
+or at flush/close, the accumulated rows go through the normal codec encoder and `Store.add_chunk` as one chunk of
+`[N, k, d]` per layer; the format is untouched (a chunk with T = k). The site becomes `<site>.<transform name>`
+and `extra["pooled"] = {"name", "rows"}` records the row names. `Reader.pooled(layer, which)` returns `[N, d]` in
+sequence order from the stored row, or computes it from `read()` and the mask on a full capture. Storage is
+"exact" by default (fp16: the last token of a bf16 model bit for bit, the mean rounded to fp16; `fp32` for exact
+means). A lossy codec that keeps outlier channels chooses them on the first chunk's rows, not per hook.
+
 ## Instrumentation regime (separate)
 
 `rescomp.instrument`: a `Patcher` that hooks the same modules and replaces their outputs with reconstructions

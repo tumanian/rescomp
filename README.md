@@ -88,6 +88,35 @@ half; `rc.Store(stem, model=..., layers=..., codec=...)` to write encoded chunks
 codec)` to re-encode a stored capture with another codec or regime; `reader.codec` is the one a file was written
 with. `rescomp.bf16_wrapper.choose_channels(X, spec)` picks outlier channels from a sample offline.
 
+### Pooled rows for probes
+
+A probe wants one vector per sequence, not one per token. `rc.TransformSink` is a `Sink` that stores a few rows
+per sequence instead of every token: the attention-mask-weighted mean over the real tokens and the last real
+token (`transform="mean+last"`, the default; also `"mean"` or `"last"`). Same hooks, tokens, annotations, flush
+and S3 as the `Sink`.
+
+```python
+sink = rc.TransformSink("runs/probe", layers=rc.bind(model, [20, 28], tokenizer=tok))   # codec "exact" by default
+with sink, torch.no_grad():
+    for batch in loader:
+        sink.annotate(label=batch["label"])
+        model(**batch)                                 # the prompt only; generate() steps are skipped
+r = rc.open("runs/probe")
+X = r.pooled(28, "mean")                               # [N, d] fp32, in sequence order
+y = r.annotation("label")
+```
+
+- Each layer's hook pools the activation on the device (`[B, T, d]` -> `[B, 2, d]` fp32); the rows accumulate per
+  layer until `chunk_seqs` (4096) sequences are in, then go through the codec and into the store as one chunk.
+  The site becomes `resid_post.mean+last`; `r.pooled_rows` names the rows, `r.read(28)` gives the `[2, d]` rows
+  of each sequence.
+- The default codec `"exact"` is an fp16 cast: the last token of a bf16 model is stored bit for bit, a mean is
+  rounded to fp16 (relative error about 5e-4). `codec="fp32"` keeps the means exactly too; the lossy regimes work
+  as well (outlier channels are chosen on the first chunk).
+- A KV-cache continuation call (a generation step) is skipped: the rows and the stored tokens describe the prompt.
+- `r.pooled(layer, "mean")` also works on a full capture from a `Sink`: the row is computed from the stored
+  tokens with the attention mask, so a probe reads either kind of capture the same way.
+
 ## Regimes
 
 Four named settings cover the useful range; pass one as `codec=`. Each is a spec template whose group and
@@ -164,6 +193,7 @@ tokenizer and forward hooks) live beside it; none of them is part of the library
 | Module | What it holds |
 |---|---|
 | `sink.py` | `Sink`: hooks a running model, encodes each layer in its hook, buffers on the device, flushes to a `Store` |
+| `transform_sink.py`, `transforms.py` | `TransformSink`: the `Sink` with a transform (`Mean`, `Last`, stacked) in place of the per-layer encoding; a few rows per sequence for probes |
 | `hooks.py` | `Layers` (what to hook) and `CallHooks` (the forward hooks and the token pre-hook), shared by the Sink and the Patcher |
 | `bindings.py`, `hf.py`, `tl.py` | `ModelBinding` and `bind()`: which modules carry the residual stream, what the header records; Hugging Face (`load_model`, `decoder_blocks`) and TransformerLens bindings |
 | `codec.py` | `Codec`: how activations are stored. The device half (`encoder()`: closed-loop deltas, the compiled per-layer function) and the host half (`pack`/`unpack`); `to_dict`/`from_header` for the file header |
