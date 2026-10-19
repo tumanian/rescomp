@@ -5,6 +5,7 @@ of a `Layers` and replaces their outputs; the model is otherwise run by the call
 
     patcher = Patcher(layers, source=rc.open("runs/run1"))              # reconstructions read from a store
     patcher = Patcher(layers, source=LiveCodec("int4_g384+layerK4+out12", channels))   # encode-decode on the fly
+    patcher = Patcher(layers, source=LiveCodec(reader.codec))                          # the codec a file was written with
     with patcher.sequences([0, 1]):                                     # which stored sequences this batch is
         logits = model(**batch)
 
@@ -19,16 +20,20 @@ import torch
 import torch.nn.functional as F
 
 from .bf16_wrapper import OutlierChannels
-from .codec import Encoder
+from .codec import Codec, as_codec
 from .hooks import CallHooks, Layers
-from .spec import Spec
 
 
 class LiveCodec:
     """Source for a Patcher: encode each hooked layer against the previous patched one, return its reconstruction."""
 
-    def __init__(self, spec, channels=None):
-        self.spec, self.channels = Spec.parse(spec), channels
+    def __init__(self, codec, channels=None):
+        """codec: a Codec (a reader's, say) or a resolved spec string; channels override the codec's."""
+        codec = as_codec(codec)
+        if codec.spec is None:
+            raise ValueError(f"LiveCodec needs a resolved spec, got {codec.given!r}")
+        self.codec = codec
+        self.spec, self.channels = codec.spec, channels if channels is not None else codec.channels
         self.enc = None
 
     def bind(self, order, all_layers=None):
@@ -39,7 +44,7 @@ class LiveCodec:
         o = None if ch is None else ch.ids
         if o is not None and all_layers and len(o) == len(all_layers) and len(self.order) != len(all_layers):
             ch = OutlierChannels(o[[list(all_layers).index(l) for l in self.order]], ch.source)
-        self.enc = Encoder(self.spec, ch, len(self.order))
+        self.enc = Codec(self.spec, channels=ch, compile=self.codec.compile).encoder(len(self.order))
 
     def __call__(self, layer, x, seq_ids, starts):
         i = self.order.index(layer)

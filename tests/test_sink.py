@@ -3,6 +3,7 @@ import pytest
 import torch
 
 import rescomp as rc
+from rescomp.bf16_wrapper import choose_channels
 from rescomp.hooks import extract_tokens_generic
 from rescomp.sink import Sink
 from tests.test_generic import D, L, ToyLM, V
@@ -43,12 +44,12 @@ def test_forward_calls_become_chunks(lm, tmp_path):
             got = torch.stack(r.read(l))
             # chunk-wise encoding of exactly these activations, outlier channels chosen on the first chunk
             cal = r.channels
-            exp = torch.cat([rc.encode(ref[:, :4], spec, cal)[1][i], rc.encode(ref[:, 4:], spec, cal)[1][i]], 0)
+            exp = torch.cat([rc.Codec(spec, channels=cal).encode(ref[:, :4])[1][i], rc.Codec(spec, channels=cal).encode(ref[:, 4:])[1][i]], 0)
             assert torch.equal(got, exp)
         assert r.header["outlier_channels"]["source"] == "first_call"
         # each layer's outlier channels came from its own activations on the first call (keyframes exactly as the
         # channels chosen offline; delta layers use the closed-loop delta, which can differ by a channel)
-        off = rc.choose_channels(ref[:, :4], spec).ids.tolist()
+        off = choose_channels(ref[:, :4], spec).ids.tolist()
         assert r.channels.ids[0].tolist() == off[0] and r.channels.ids[2].tolist() == off[2]
         assert len(set(r.channels.ids[1].tolist())) == 2
 
@@ -70,7 +71,7 @@ def test_generation_style_calls_are_one_sequence(lm, tmp_path):
         for l in (0, 1, 2):
             assert r.read(l, 1).shape == (6, D)
         # each call was encoded on its own; the stitched sequence is the concatenation of those encodings
-        parts = [rc.encode(reference(lm, toks[:, :3]), spec)[1]] + [rc.encode(reference(lm, toks[:, t: t + 1]), spec)[1] for t in range(3, 6)]
+        parts = [rc.Codec(spec).encode(reference(lm, toks[:, :3]))[1]] + [rc.Codec(spec).encode(reference(lm, toks[:, t: t + 1]))[1] for t in range(3, 6)]
         exp = torch.cat(parts, 2)
         assert torch.equal(torch.stack(r.read(0, [0, 1])), exp[0]) and torch.equal(torch.stack(r.read(2, [0, 1])), exp[2])
 

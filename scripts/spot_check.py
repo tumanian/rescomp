@@ -87,7 +87,7 @@ def main():
                     rel = ((x - ref[l]).norm() / ref[l].norm()).item()
                     ok &= check(rel <= bound[regime], f"layer {l}: rel L2 vs hooked activations {rel:.2e} (bound {bound[regime]:.0e}); file says {r.header['layers'][r.layers.index(l)]['fidelity']['rel_l2']:.2e}")
                 # bytes: the CPU encode of the hooked activations vs what the GPU Sink wrote
-                e = rc.Encoder(r.spec, r.channels, len(a.layers))
+                e = r.codec.encoder(len(a.layers))
                 for i, l in enumerate(a.layers):
                     strm, _ = e.encode_layer(i, ref[l])
                     stored = r.streams(0, l)

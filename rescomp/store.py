@@ -33,8 +33,9 @@ S3 fits the layout: tensor files are immutable once closed (each flush closes th
 is readable mid-run), the table parts are small immutable objects, and blob reads are offset-plus-length
 range requests.
 
-`Store` takes already-encoded streams (the Sink owns the encoder); `Reader` decodes; `transcode` re-encodes a
-stored capture with another spec without the model.
+`Store` takes already-encoded streams (the Sink runs the codec's encoder) and a `Codec` (which packs them and
+goes into the header); `Reader` rebuilds the codec from the header and decodes; `transcode` re-encodes a stored
+capture with another codec without the model.
 """
 import json
 import os
@@ -53,11 +54,9 @@ import torch
 
 from . import lossless as LL
 from ._version import __version__
-from .bf16_wrapper import OutlierChannels, check_channels, choose_channels
-from .codec import Decoder, Encoder
-from .lossless import lossless
+from .bf16_wrapper import choose_channels
+from .codec import Codec, as_codec
 from .quant import CODEC_VERSION
-from .spec import Spec
 
 FORMAT = b"RSC4"
 FORMAT_VERSION = 4
@@ -174,8 +173,8 @@ class BlobFiles:
     On a remote filesystem flush() closes the current file (an object is only readable once complete) and the
     next append starts a new one."""
 
-    def __init__(self, loc, rotate_bytes=None, codec=None):
-        self.loc, self.codec = loc, codec or lossless()
+    def __init__(self, loc, codec, rotate_bytes=None):
+        self.loc, self.codec = loc, codec
         self.rotate_bytes = int(rotate_bytes or loc.rotate_default)
         self.n = -1
         self.f = None
@@ -192,7 +191,7 @@ class BlobFiles:
 
     def append(self, t):
         t = t.detach() if isinstance(t, torch.Tensor) else torch.as_tensor(np.asarray(t))
-        comp, raw = self.codec.compress(t)
+        comp, raw = self.codec.pack(t)
         if self.f is None or (self.pos > FILE_HEAD and self.pos + len(comp) > self.rotate_bytes):
             self._open_new()
         self.f.write(comp)
@@ -280,13 +279,12 @@ def tokens_table(seq, ids):
 class Store:
     """The writer. Give it encoded chunks and per-sequence tokens; call flush() to make the files readable."""
 
-    def __init__(self, stem, *, model, layers, spec=None, channels=None, site="resid_post", level=3, shuffle=True,
-                 hook_names=None, extra=None, rotate_bytes=None, overwrite=False, bucket=None, prefix=None, s3=None):
+    def __init__(self, stem, *, model, layers, codec="exact", site="resid_post", hook_names=None, extra=None,
+                 rotate_bytes=None, overwrite=False, bucket=None, prefix=None, s3=None):
         """stem: a local path stem, an s3://bucket/prefix/name URI, or a name with bucket= and prefix=.
-        spec may be None at construction (a regime that needs the model width) and set with set_spec()
-        before the first chunk. level/shuffle configure the zstd lossless stage (rescomp.lossless);
-        rotate_bytes defaults to 4 GiB locally and 1 GiB on S3. An existing capture at the stem is an error
-        unless overwrite=True, which removes its files first."""
+        codec: a Codec or anything Codec() takes; a regime that needs the model width must be resolved
+        (codec.resolve(d)) before the first chunk. rotate_bytes defaults to 4 GiB locally and 1 GiB on S3.
+        An existing capture at the stem is an error unless overwrite=True, which removes its files first."""
         self.loc = location(stem, bucket, prefix, s3)
         self.stem = self.loc.uri
         if self.loc.exists(table_path(self.loc, "meta")):
@@ -294,22 +292,17 @@ class Store:
                 raise FileExistsError(f"{self.stem}: a capture already exists here; Store(..., overwrite=True) replaces it")
             for p in capture_files(self.loc):
                 self.loc.fs.delete_file(p)
-        self.spec = None if spec is None else Spec.parse(spec)
+        self.codec = as_codec(codec)
         self.layers = check_layers(layers)
-        self.channels = channels
         self.n_chunks = self.n_blobs = self.n_tokens = 0          # totals over every flush
         self.n_parts = 0                                            # table parts published so far
         self._new_chunks, self._new_blobs, self._dirty = [], [], set()   # since the last flush
-        if self.spec is not None:
-            self.set_spec(self.spec)
         self.model, self.site = dict(model), site
-        self.codec = lossless(level=level, shuffle=shuffle)
         self.hook_names = {str(k): v for k, v in (hook_names or {}).items()}
         self.extra = dict(extra or {})
-        self.regime = None               # the regime name this spec came from, if any
         json.dumps({"model": self.model, "hook_names": self.hook_names, "extra": self.extra})   # header fields must be JSON
         self.loc.ensure_dir()
-        self.blobs = BlobFiles(self.loc, rotate_bytes, self.codec)
+        self.blobs = BlobFiles(self.loc, self.codec, rotate_bytes)
         self.seq = {}                    # seq_id -> {"tokens": list[int] | None, "mask": list[int] | None, "ann": {}, "n_from_chunks": int}
         self.d = None
         L = len(self.layers)
@@ -321,14 +314,9 @@ class Store:
         self.t0 = time.time()
         self.closed = False
 
-    def set_spec(self, spec):
-        if self.n_chunks:
-            raise ValueError("spec cannot change after the first chunk")
-        self.spec = Spec.parse(spec)
-        if not self.spec.outliers:
-            self.channels = None
-        elif self.channels is not None:
-            check_channels(self.channels, self.spec, len(self.layers))
+    @property
+    def spec(self):
+        return self.codec.spec
 
     # -- sequences
     def new_sequence(self, tokens=None, mask=None, **annotations):
@@ -359,8 +347,8 @@ class Store:
         (sum of squared error, sum of squares, max abs error) for the fidelity record. Returns the chunk id."""
         if self.closed:
             raise ValueError("store is closed")
-        if self.spec is None:
-            raise ValueError("set_spec() before the first chunk")
+        if self.codec.spec is None:
+            raise ValueError(f"codec {self.codec.given!r} is not resolved: codec.resolve(d) before the first chunk")
         check_streams(streams, len(self.layers))
         seq_ids = [int(s) for s in seq_ids]
         missing = [s for s in seq_ids if s not in self.seq]
@@ -396,19 +384,19 @@ class Store:
 
     # -- tables
     def _meta(self):
-        spec = self.spec or Spec("bf16")
-        layers = [{"index": i, "layer": l, "site": f"{self.site}.{l}", "quant": spec.quant_for(i),
-                   "keyframe": spec.is_key(i),
-                   "outlier_channels": self.channels.ids[i].tolist() if self.channels is not None else None,
+        spec, channels, rec = self.codec.spec, self.codec.channels, self.codec.to_dict()
+        layers = [{"index": i, "layer": l, "site": f"{self.site}.{l}", "quant": spec.quant_for(i) if spec else None,
+                   "keyframe": spec.is_key(i) if spec else None,
+                   "outlier_channels": channels.ids[i].tolist() if channels is not None and channels.ids is not None else None,
                    "hook": self.hook_names.get(str(l)),
                    "fidelity": {"rel_l2": float(np.sqrt(self.sse[i] / self.ss[i])) if self.ss[i] > 0 else None,
                                 "max_abs": float(self.maxabs[i]) if self.n_measured else None}} for i, l in enumerate(self.layers)]
         total = float(self.ss.sum())
         return {"format": FORMAT.decode(), "version": FORMAT_VERSION, "codec": CODEC_VERSION, "library": f"rescomp {__version__}",
                 "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "model": json.dumps(self.model),
-                "spec": self.spec.name if self.spec else None, "regime": self.regime,
-                "outlier_channels": json.dumps((self.channels or OutlierChannels(None, "none")).to_dict()),
-                "lossless": json.dumps(self.codec.to_dict()),
+                "spec": rec["spec"], "regime": rec["regime"],
+                "outlier_channels": json.dumps(rec["outlier_channels"]),
+                "lossless": json.dumps(rec["lossless"]),
                 "site": self.site, "d_model": self.d, "layers": json.dumps(layers),
                 "fidelity": json.dumps({"rel_l2": float(np.sqrt(self.sse.sum() / total)) if total > 0 else None,
                                         "max_abs": float(self.maxabs.max()) if self.n_measured else None,
@@ -484,12 +472,10 @@ class Reader:
         self.header = dict(m, model=json.loads(m["model"]), outlier_channels=json.loads(m["outlier_channels"]), lossless=json.loads(m["lossless"]),
                            layers=json.loads(m["layers"]), fidelity=json.loads(m["fidelity"]), extra=json.loads(m["extra"]),
                            bytes=json.loads(m["bytes"]))
-        self.spec = Spec.parse(m["spec"])
-        self.regime = m.get("regime")
-        self.channels = OutlierChannels.from_dict(self.header["outlier_channels"])
+        self.codec = Codec.from_header(self.header)
+        self.spec, self.regime, self.channels = self.codec.spec, self.codec.regime, self.codec.channels
         self.layers = [l["layer"] for l in self.header["layers"]]
         self.d = m["d_model"]
-        self.codec = lossless(self.header["lossless"])
         n_parts = m["n_parts"]
         self.chunks = self._read_parts("chunks", n_parts, chunks_table).to_pylist()
         self.blobs = defaultdict(dict)                   # (chunk, layer) -> stream -> record
@@ -551,7 +537,7 @@ class Reader:
             raise ValueError("truncated blob file")
         if self.verify and zlib.crc32(b) != rec["crc32"]:
             raise ValueError(f"crc mismatch in file {rec['file']} at offset {rec['offset']}")
-        return self.codec.decompress(b, rec["dtype"], rec["shape"], rec["raw_nbytes"])
+        return self.codec.unpack(b, rec["dtype"], rec["shape"], rec["raw_nbytes"])
 
     def streams(self, chunk, layer):
         return {k: self._read_blob(r) for k, r in self.blobs[(chunk, layer)].items()}
@@ -564,7 +550,7 @@ class Reader:
             xs = [None] * len(self.layers)
         if xs[upto] is not None:
             return xs
-        dec = Decoder(self.spec, self.channels, len(self.layers))
+        dec = self.codec.decoder(len(self.layers))
         first = upto - (upto % self.spec.K) if self.spec.K else upto
         have = [i for i in range(first, upto) if xs[i] is not None]
         if have:
@@ -665,26 +651,28 @@ def _sample_channels(r, spec, n_seqs):
 
 
 @torch.no_grad()
-def transcode(src, dst, spec, sample_seqs=32, level=3, rotate_bytes=None, extra=None, overwrite=False, src_loc=None, dst_loc=None):
-    """Re-encode a stored capture with another spec, chunk by chunk, without the model. Meant for a lossless
+def transcode(src, dst, codec, sample_seqs=32, rotate_bytes=None, extra=None, overwrite=False, src_loc=None, dst_loc=None):
+    """Re-encode a stored capture with another codec, chunk by chunk, without the model. Meant for a lossless
     source (exact / bf16); the source spec and its measured error are recorded in the new header's extra.
-    Outlier channels (+out) are chosen on the first `sample_seqs` sequences of the source.
-    src_loc / dst_loc: {"bucket": ..., "prefix": ..., "s3": {...}} for either end. Returns the new Store's stats."""
-    from .regimes import resolve
+    `codec`: a Codec or anything Codec() takes; outlier channels (+out) it does not carry are chosen on the first
+    `sample_seqs` sequences of the source. src_loc / dst_loc: {"bucket": ..., "prefix": ..., "s3": {...}} for
+    either end; overwrite=True replaces a capture at dst. Returns the new Store's stats."""
+    codec = as_codec(codec)
     with Reader(src, **(src_loc or {})) as r:
-        spec = resolve(spec, r.d)
-        channels = _sample_channels(r, spec, sample_seqs) if spec.outliers else None
+        spec = codec.resolve(r.d)
+        if spec.outliers and codec.channels is None:
+            codec.channels = _sample_channels(r, spec, sample_seqs)
         ex = dict(r.header["extra"])
         ex.update({"transcoded_from": r.loc.label, "source_spec": r.spec.name,
                    "source_rel_l2": r.header["fidelity"]["rel_l2"]}, **(extra or {}))
         hooks = {l["layer"]: l["hook"] for l in r.header["layers"] if l.get("hook")}
-        with Store(dst, model=r.header["model"], layers=r.layers, spec=spec, channels=channels, site=r.header["site"],
-                   level=level, hook_names=hooks, extra=ex, rotate_bytes=rotate_bytes, overwrite=overwrite, **(dst_loc or {})) as st:
+        with Store(dst, model=r.header["model"], layers=r.layers, codec=codec, site=r.header["site"],
+                   hook_names=hooks, extra=ex, rotate_bytes=rotate_bytes, overwrite=overwrite, **(dst_loc or {})) as st:
             for row in r.tokens_table.to_pylist():
                 sid = row["seq_id"]
                 new = st.new_sequence(row["tokens"], row["mask"], **{k: row[k] for k in r.annotations})
                 assert new == sid
-            enc = Encoder(spec, channels, len(r.layers))
+            enc = codec.encoder(len(r.layers))
             for c in r.chunks:
                 ci = c["chunk"]
                 acts = [r.decode_chunk(ci, i)[i] for i in range(len(r.layers))]

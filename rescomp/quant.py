@@ -1,4 +1,4 @@
-"""Quantizers: one class per format, all built by `quantizer(name)`.
+"""Quantizers: one class per format, each a registered Stage, all built by `quantizer(name)`.
 
 A quantizer turns one fp32 tensor v [..., d] (the channel dim last) into codes plus scales and back:
     scales(v) -> list of scale tensors      encode(v, scales) -> codes      decode(codes, scales) -> fp32
@@ -15,12 +15,15 @@ encoder and the decoder, and the on-disk bytes are pinned to the library that do
 | nvfp4          | NVFP4        | torchao nvfp4_quantize: e2m1 codes, e4m3 scale per 16, fp32 tensor scale |
 """
 import re
-from abc import ABC, abstractmethod
+from abc import abstractmethod
+from functools import cache
 
 import torch
 from torchao.prototype.mx_formats import kernels as mxk
 from torchao.prototype.mx_formats import mx_tensor, nvfp4_tensor
 from torchao.quantization import quant_primitives as qp
+
+from .stage import Stage, register, stage
 
 CODEC_VERSION = 3
 FP16_TINY = 2.0 ** -14
@@ -28,17 +31,18 @@ FP16_MAX = 65504.0
 MX_ELEM = torch.float4_e2m1fn_x2
 
 
-class Quantizer(ABC):
+class Quantizer(Stage):
+    kind = "quant"
     pattern: "re.Pattern"          # matches the names this class builds
     group = None                   # channels per scale (None: per token or none)
     codes_per_byte = 1
 
-    def __init__(self, name):
-        self.name = name
-
     @classmethod
     def matches(cls, name):
         return cls.pattern.fullmatch(name) is not None
+
+    def to_dict(self):
+        return {"name": self.name}
 
     def check_dim(self, d):
         """Raise if this quantizer cannot block a channel dim of d."""
@@ -59,9 +63,6 @@ class Quantizer(ABC):
     def decode(self, codes, S):
         ...
 
-    def __repr__(self):
-        return f"{type(self).__name__}({self.name!r})"
-
 
 def fp16_inexact(x):
     """A 0-d bool on x's device: whether an fp16 cast loses what the model has. bf16 / fp16 inputs: any value that
@@ -81,6 +82,7 @@ def _block(v, G):
     return (1,) * (v.dim() - 1) + (G,)
 
 
+@register
 class Cast(Quantizer):
     pattern = re.compile(r"fp32|bf16|fp16")
 
@@ -98,6 +100,7 @@ class Cast(Quantizer):
         return codes.clone() if self.name == "fp32" else codes.float()      # never alias the codes stream
 
 
+@register
 class PerTokenFp8(Quantizer):
     pattern = re.compile(r"fp8_e4m3")
 
@@ -141,10 +144,12 @@ class _Affine(Quantizer):
         return qp.dequantize_affine(c, self._block(c), S[0], zp, torch.int8, qmin, qmax, output_dtype=torch.float32)
 
 
+@register
 class PerTokenInt8(_Affine):
     pattern = re.compile(r"int8_tok")
 
 
+@register
 class GroupInt(_Affine):
     pattern = re.compile(r"int([48])_g([1-9]\d*)")
 
@@ -155,6 +160,7 @@ class GroupInt(_Affine):
         self.codes_per_byte = 8 // self.bits
 
 
+@register
 class MXFP4(Quantizer):
     pattern = re.compile(r"mxfp4")
     group, codes_per_byte = 32, 2
@@ -169,6 +175,7 @@ class MXFP4(Quantizer):
         return mx_tensor.to_dtype(codes, S[0], MX_ELEM, 32, torch.float32)
 
 
+@register
 class NVFP4(Quantizer):
     pattern = re.compile(r"nvfp4")
     group, codes_per_byte = 16, 2
@@ -188,18 +195,9 @@ class NVFP4(Quantizer):
         return x * (S[1].float() * S[0]).repeat_interleave(16, -1)
 
 
-QUANTIZERS = [Cast, PerTokenFp8, PerTokenInt8, GroupInt, MXFP4, NVFP4]
-_CACHE = {}
-
-
+@cache
 def quantizer(name):
-    """Factory: the Quantizer for a name such as "int4_g512" (instances are cached, one per name)."""
-    q = _CACHE.get(name)
-    if q is None:
-        for cls in QUANTIZERS:
-            if isinstance(name, str) and cls.matches(name):
-                q = _CACHE[name] = cls(name)
-                break
-        else:
-            raise ValueError(f"unknown quantizer {name!r}")
-    return q
+    """Factory: the Quantizer for a name such as "int4_g512" (one instance per name)."""
+    if not isinstance(name, str):
+        raise ValueError(f"quantizer name must be a string, got {name!r}")
+    return stage("quant", name)

@@ -33,7 +33,7 @@ def main():
     run = lambda: model(ids, use_cache=False)
     acts = [ProfilerActivity.CPU] + ([ProfilerActivity.CUDA] if dev.type == "cuda" else [])
     with torch.no_grad(), tempfile.TemporaryDirectory() as d:
-        sink = rc.Sink(f"{d}/p", rc.bind(model, a.layers, tokenizer=tok), a.spec, buffer_bytes=1 << 40, compile=a.compile)
+        sink = rc.Sink(f"{d}/p", rc.bind(model, a.layers, tokenizer=tok), rc.Codec(a.spec, compile=a.compile), buffer_bytes=1 << 40)
         with sink:
             for _ in range(3):
                 run()

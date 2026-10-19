@@ -56,8 +56,7 @@ def main():
         res = {}
         for fid in (False, True):
             with tempfile.TemporaryDirectory() as d:
-                sink = rc.Sink(f"{d}/ov", rc.bind(model, a.layers, tokenizer=tok), a.spec, buffer_bytes=1 << 40, fidelity=fid,
-                               compile=a.compile)
+                sink = rc.Sink(f"{d}/ov", rc.bind(model, a.layers, tokenizer=tok), rc.Codec(a.spec, compile=a.compile), buffer_bytes=1 << 40, fidelity=fid)
                 with sink:
                     timed(run, 3, sync)
                     if cuda:

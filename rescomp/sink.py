@@ -1,6 +1,6 @@
 """The Sink: hooks on a running model, activations flow into a store. The model is not wrapped.
 
-    sink = Sink("runs/run1", layers=bind(model, [8, 9, 10, 11]), spec="balanced")   # a regime or a spec string
+    sink = Sink("runs/run1", layers=bind(model, [8, 9, 10, 11]), codec="balanced")  # a regime, a spec string or a Codec
     with sink:
         model(**batch)              # one forward call = one chunk
         model.generate(**prompt)    # each step = one chunk; the reader returns the sequence whole
@@ -27,48 +27,51 @@ import warnings
 import torch
 
 from .bf16_wrapper import OutlierChannels, check_channels, choose_layer_channels
-from .codec import Encoder
+from .codec import as_codec
 from .hooks import CallHooks, Layers, extract_tokens_generic  # noqa: F401  (re-exported for callers)
 from .quant import fp16_inexact
-from .regimes import is_regime, needs_width, resolve
 from .store import Store, check_annotation_names
 
 
 class Sink:
-    def __init__(self, stem, layers, spec, *, tokens=None, channels=None, buffer_bytes=1 << 30, rotate_bytes=None,
-                 level=3, site="resid_post", extra=None, model_info=None, fidelity=False, compile=False, check_exact=None,
-                 overwrite=False, bucket=None, prefix=None, s3=None):
+    def __init__(self, stem, layers, codec="balanced", *, tokens=None, buffer_bytes=1 << 30, rotate_bytes=None,
+                 site="resid_post", extra=None, model_info=None, fidelity=False, check_exact=None, overwrite=False,
+                 bucket=None, prefix=None, s3=None):
         """stem: a local path stem, an s3://bucket/prefix/name URI, or a name with bucket= and prefix= (see
-        rescomp.store.location); an existing capture there is an error unless overwrite=True. fidelity=True also
-        measures each layer's reconstruction error in the hook (an extra reconstruction and three reductions per
-        layer, in fp32): useful once, costly on every forward. compile=True runs the quantizer through torch.compile
-        (fused kernels; a one-time compile per shape class). check_exact (default: on for the `exact` regime) checks
-        every call that fp16 holds this model's values (bf16 / fp16 models: exactly; wider: within range) and raises
-        otherwise; see rescomp.quant.fp16_inexact."""
+        rescomp.store.location); an existing capture there is an error unless overwrite=True. codec: a Codec, or a
+        regime name / spec string for Codec() (regimes resolve on the first call, when the width is known).
+        fidelity=True also measures each layer's reconstruction error in the hook (an extra reconstruction and three
+        reductions per layer, in fp32): useful once, costly on every forward. check_exact (default: on for the `exact`
+        regime) checks every call that fp16 holds this model's values (bf16 / fp16 models: exactly; wider: within
+        range) and raises otherwise; see rescomp.quant.fp16_inexact."""
         if tokens not in (None, "off"):
             raise ValueError("tokens must be None (pre-hook) or 'off'")
-        self.check_exact = (spec == "exact") if check_exact is None else bool(check_exact)
-        self._spec_arg = spec
-        self.spec = None if needs_width(spec) else resolve(spec)     # regimes resolve on the first call (need d)
+        self.codec = as_codec(codec)
+        self.check_exact = (self.codec.regime == "exact") if check_exact is None else bool(check_exact)
         self.hooks = CallHooks(layers, on_layer=self._on_layer, on_end=self._complete_call, tokens=tokens is None)
         L, self.order = self.hooks.layers, self.hooks.order
         self.layers = L
-        self.fidelity, self.compile = fidelity, compile
-        self.channels = channels
+        self.fidelity = fidelity
         self.buffer_bytes, self.site = buffer_bytes, site
         info = dict(L.model_info)
         info.update(model_info or {})
         info.setdefault("n_layers", L.n_layers)
-        self.store = Store(stem, model=info, layers=self.order, spec=self.spec, channels=channels, site=site, level=level,
-                           hook_names=L.hook_names, extra=dict(extra or {}), rotate_bytes=rotate_bytes, overwrite=overwrite,
-                           bucket=bucket, prefix=prefix, s3=s3)
-        self.store.regime = spec if is_regime(spec) else None
+        self.store = Store(stem, model=info, layers=self.order, codec=self.codec, site=site, hook_names=L.hook_names,
+                           extra=dict(extra or {}), rotate_bytes=rotate_bytes, overwrite=overwrite, bucket=bucket, prefix=prefix, s3=s3)
         self.enc = None
         self._pending_ann = {}
         self._open, self._len = [], {}    # open sequence ids and their current lengths
         self._buffer, self._buffered = [], 0     # encoded chunks waiting for zstd + write
         self._choosing = False
         self.t0 = time.time()
+
+    @property
+    def spec(self):
+        return self.codec.spec
+
+    @property
+    def channels(self):
+        return self.codec.channels
 
     @property
     def n_calls(self):
@@ -137,7 +140,6 @@ class Sink:
         call["streams"][l] = st                        # stays on the device until flush
         if l == self.order[-1] and self._choosing:
             self._choosing = False
-            self.store.channels = self.channels
 
     # -- a complete forward call
     def _complete_call(self, call):
@@ -149,7 +151,7 @@ class Sink:
             bad = [l for l in self.order if bool(call["inexact"][l])]
             if bad:
                 raise ValueError(f"the exact regime (fp16) cannot hold layer(s) {bad} of this call: a value is above 65504 "
-                                 "in magnitude or too small for fp16; use spec='bf16' (exact for any bf16 model, at a "
+                                 "in magnitude or too small for fp16; use codec='bf16' (exact for any bf16 model, at a "
                                  "lower ratio) or check_exact=False to accept fp16's clamping")
         B, T, d = call["shape"]
         cont = call["cont"]
@@ -200,16 +202,14 @@ class Sink:
         outlier channels, the first call chooses each layer's in that layer's own hook, from what the encoder is
         about to quantize (x at keyframes, x - xhat_prev at delta layers); see bf16_wrapper."""
         if self.enc is None:
-            if self.spec is None:
-                self.spec = resolve(self._spec_arg, x0.shape[-1])
-                self.store.set_spec(self.spec)
-            if self.channels is None and self.spec.outliers:
-                self.channels = OutlierChannels.placeholder(len(self.order), self.spec.outliers)
+            c = self.codec
+            spec = c.resolve(x0.shape[-1])
+            if c.channels is None and spec.outliers:
+                c.channels = OutlierChannels.placeholder(len(self.order), spec.outliers)
                 self._choosing = True
-            elif self.spec.outliers:
-                check_channels(self.channels, self.spec, len(self.order))
-                self.store.channels = self.channels
-            self.enc = Encoder(self.spec, self.channels, len(self.order), compile=self.compile)
+            elif spec.outliers:
+                check_channels(c.channels, spec, len(self.order))
+            self.enc = c.encoder(len(self.order))
         self.enc.reset()
 
     def _choose_channels(self, i, x):
