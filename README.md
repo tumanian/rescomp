@@ -2,8 +2,7 @@
 
 Compress the residual-stream activations of a running transformer and keep them, with the tokens, labels and
 model metadata that interpretability work needs later. Pure PyTorch + zstd + Parquet, CPU or GPU, any framework
-whose layers are `nn.Module`s. The model is not wrapped: you add a sink, run the model as you always do, and read
-the files afterwards.
+whose layers are `nn.Module`s. 
 
 - `DESIGN.md`: the design decisions behind the sink and the storage layout.
 - `RESULTS.md`: what each codec costs, measured on eight models (GPT-2 to Qwen3-30B-A3B, dense and MoE).
