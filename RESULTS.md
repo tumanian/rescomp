@@ -360,6 +360,49 @@ hybrid 0 on both keyframes and ≤ 0.004 between; `int8_tok` and `uabs` ≤ 0.00
     a model is to be probed, store it as a keyframe (choose the stored range so it falls on a multiple of K, or
     use `+key=bf16` with a range ending on a keyframe).
 
+## Probes on pooled rows (2026-10-19)
+
+`scripts/probes.py`: SST-2 sentences (2000 train, the 872 validation sentences as test) through GPT-2 small with a
+lossless full `Sink` and a `TransformSink` (fp32, `mean+last`) attached to the same forward, then once more per
+lossy regime. From every capture `Reader.pooled(layer, row)` gives one vector per sentence: the full captures
+compute it from the stored tokens with the attention mask, the TransformSink stored it. A logistic-regression probe
+(L-BFGS, standardized features, small L2) per layer and row is trained on the lossless features and on the
+TransformSink's, and tested on every capture's features. Run on the CPU in fp32 (the GPU box's session had
+expired), so the lossless capture is the `fp32` codec; on a bf16 model it would be `exact`. Stored layers 6, 9, 11:
+layer 6 is the keyframe of both lossy regimes, 9 and 11 are int4 delta layers in both, which is why their errors agree.
+
+| Capture | spec | stored | note |
+|---|---|---|---|
+| full fp32 | `fp32` | 866 MB | the lossless reference |
+| TransformSink | `fp32` | 46 MB | 19x smaller: two rows per sentence instead of every token |
+| full balanced | `int4_g96+layerK4+out8+key=bf16` | 150 MB | ratios here are inflated by the padded positions |
+| full compact | `int4_g96+layerK4+out8` | 63 MB | |
+
+Feature error against the lossless full capture (rel L2 over the test set) and probe accuracy (train source → test
+source; in brackets, agreement with the same probe's predictions on the lossless features):
+
+| Layer | row | TransformSink err | balanced err | compact err | lossless → lossless | lossless → TransformSink | lossless → balanced | lossless → compact | TransformSink → lossless |
+|---|---|---|---|---|---|---|---|---|---|
+| 6 | mean | 0 | 1.3e-03 | 9.3e-03 | 80.3% | 80.3% (100%) | 80.2% (99.9%) | 80.3% (97.0%) | 80.3% |
+| 6 | last | 0 | 1.7e-03 | 1.2e-01 | 81.3% | 81.3% (100%) | 81.3% (100%) | 80.4% (93.6%) | 81.3% |
+| 9 | mean | 0 | 5.7e-03 | 5.7e-03 | 79.1% | 79.1% (100%) | 79.5% (98.5%) | 80.0% (98.2%) | 79.1% |
+| 9 | last | 0 | 3.9e-02 | 4.0e-02 | 80.8% | 80.8% (100%) | 81.2% (96.9%) | 81.1% (96.6%) | 80.8% |
+| 11 | mean | 0 | 3.3e-02 | 3.3e-02 | 78.2% | 78.2% (100%) | 76.9% (89.3%) | 77.3% (89.4%) | 78.2% |
+| 11 | last | 0 | 7.4e-02 | 7.4e-02 | 81.8% | 81.8% (100%) | 73.5% (80.3%) | 73.5% (80.7%) | 81.8% |
+
+- **The TransformSink's rows are the lossless capture's pooled rows, bit for bit** (error 0 on every layer and
+  row, on the CPU; on a GPU the mean's summation order can differ in the last bits). A probe trained on either
+  capture gives the same predictions on the other, so a probe study can use the 19x smaller pooled capture
+  (100-300x smaller at the sequence lengths of the overhead table) and the full capture interchangeably.
+- **Lossy full captures work for probes on early and middle layers, not on the last one.** At layers 6 and 9 a
+  probe trained on lossless features keeps its accuracy on `balanced` and `compact` features (within 1 point,
+  97-100% agreement). At layer 11, GPT-2's last layer, the int4 delta error (rel L2 3e-2 on means, 7e-2 on last
+  tokens) costs the last-token probe 8 points (81.8% → 73.5%, 80% agreement) and the mean probe 1 point. Mean
+  rows average the error out; last-token rows carry it whole. A probe on a compressed capture should either be
+  trained on the same capture or use a keyframe layer.
+- Absolute accuracies (78-82%) are what a linear probe on GPT-2 small's residual stream gives on SST-2 with 2000
+  training sentences; they are not the point here.
+
 ## Summary
 
 - **A recipe's ratio is fixed; its cost is per model.** Across eight models from 124M to 30B parameters, dense
