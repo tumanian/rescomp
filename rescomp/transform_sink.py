@@ -20,6 +20,7 @@ call after a call of the same batch size counts as a continuation.
 import torch
 
 from .bf16_wrapper import check_channels, choose_channels
+from .quant import fp16_inexact
 from .sink import Sink
 from .transforms import transform as as_transform
 
@@ -45,7 +46,10 @@ class TransformSink(Sink):
             if m is not None and m.shape[-1] != x.shape[1]:
                 m = m[..., -x.shape[1]:]                 # a generation step without the cache signal: the mask covers the whole sequence so far
             call["mask_on"] = None if m is None else m.to(x.device)
-        call.setdefault("pooled", {})[l] = self.transform(x, call["mask_on"])
+        rows = self.transform(x, call["mask_on"])
+        call.setdefault("pooled", {})[l] = rows
+        if self.check_exact:                           # the exact regime must hold the pooled rows, not x
+            call.setdefault("inexact", {})[l] = fp16_inexact(rows)
 
     # -- extension point 2: accumulate; a chunk is emitted when enough sequences are in
     def _call_step(self, call, cont):

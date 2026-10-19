@@ -38,22 +38,31 @@ rec.stats()                                 # chunks, sequences, bytes, ratio, p
   arguments by the pre-hook). Each call is encoded on its own (small one-token blobs compress ~10-20% worse than a merged
   sequence would); the reader concatenates. Sequence length is per chunk.
 
-## Storage layout (format version 3)
+## Storage layout (format version 4)
 
 Tensors and metadata are separated:
 
 | File | Contents |
 |---|---|
 | `run1.<n>.rsc` | only the compressed tensor blobs (codes, scales, outliers, sink rows), one blob per (chunk, layer, stream), concatenated; a magic and a format version at the front |
-| `run1.meta.parquet` | one row: format version, library version, created, model info (JSON), spec, outlier channels (JSON), lossless settings, site, stored layers with hook names and measured fidelity (JSON) |
-| `run1.blobs.parquet` | one row per blob: chunk, sequence id, start position, n_tokens, layer, stream, file number, offset, nbytes, raw_nbytes, crc32, dtype, shape |
-| `run1.tokens.parquet` | one row per sequence: seq id, n_tokens, token ids (list<int32>), attention mask (list<uint8>, optional), and every annotation as its own column (scalars as plain columns, per-token arrays as list columns, per-layer routing as list columns) |
+| `run1.meta.parquet` | one row: format version, library version, created, model info (JSON), spec, outlier channels (JSON), lossless settings, site, stored layers with hook names and measured fidelity (JSON), byte counts, `n_parts`; written last at every flush, atomically |
+| `run1.chunks.<k>.parquet` | part k, the chunks of the k-th flush: chunk id, sequence ids, start positions, n_tokens, n_seq |
+| `run1.blobs.<k>.parquet` | part k, the blobs of the k-th flush: chunk, layer, stream, file number, offset, nbytes, raw_nbytes, crc32, dtype, shape |
+| `run1.tokens.<k>.parquet` | part k, the sequences new or changed in the k-th flush (the last part holding a sequence wins), one row each: seq id, n_tokens, token ids (list<int32>), attention mask (list<uint8>, optional), and every annotation as its own column (scalars as plain columns, per-token arrays as list columns, per-layer routing as list columns) |
 
 Why: the per-sequence table is directly queryable (pandas, DuckDB, Polars) without touching the tensors, tokens
 and labels live next to each other, and the tensor file stays a dumb append-only stream that rotation can cut.
 `rc.Reader` opens the set by its stem (`read`, `read_padded`, `tokens`, `attention_mask`, `annotation`).
-Dependency: `pyarrow`. Format 3 (2026-10-19) is format 2 with codec 3 (torchao-pinned quantizers, `uabs` gone);
+Dependency: `pyarrow`. Format 3 (2026-10-19) was format 2 with codec 3 (torchao-pinned quantizers, `uabs` gone);
 the reader names a mismatched format or codec version instead of guessing.
+Format 4 (2026-10-18, after review): the tables are written in parts, one per flush, and the meta table last,
+through a renamed temporary file locally (an S3 PUT is atomic by itself). Before, every flush rewrote every table
+whole (quadratic over a run) and wrote the meta table first, so a flush that failed on a later table left a meta row
+counting rows the tables did not hold. Also from that review: a stem that already holds a capture is refused unless
+`overwrite=True` (it used to be replaced silently), annotation names cannot shadow the tokens table's own columns,
+the header records a local capture by its stem's name rather than its absolute path, and the `exact` regime checks
+each call that fp16 holds the model's values (it clamps at 65504 and flushes below 6e-8; "bit-exact for bf16
+models" held only inside that range).
 
 ## Pooled rows for probes (2026-10-19)
 

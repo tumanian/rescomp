@@ -5,7 +5,7 @@ import torch
 
 import rescomp as rc
 from rescomp.sink import Sink
-from tests.test_generic import D, V, ToyLM, toy_layers
+from tests.test_generic import D, ToyLM, V, toy_layers
 
 moto = pytest.importorskip("moto")
 boto3 = pytest.importorskip("boto3")
@@ -43,9 +43,9 @@ def test_sink_to_s3_and_read_back(s3, lm):
         sink.annotate(doc=[1, 2, 3])
         lm(toks[:3])
         lm(toks[3:])
-    assert keys(client, "acts", "team/exp/run1") == ["team/exp/run1.00000.rsc", "team/exp/run1.blobs.parquet",
-                                                     "team/exp/run1.chunks.parquet", "team/exp/run1.meta.parquet",
-                                                     "team/exp/run1.tokens.parquet"]
+    assert keys(client, "acts", "team/exp/run1") == ["team/exp/run1.00000.rsc", "team/exp/run1.blobs.00000.parquet",
+                                                     "team/exp/run1.chunks.00000.parquet", "team/exp/run1.meta.parquet",
+                                                     "team/exp/run1.tokens.00000.parquet"]
     assert sink.stats()["files"] == ["acts/team/exp/run1.00000.rsc"]
     for opener in (lambda: rc.open("run1", bucket="acts", prefix="team/exp", s3=opts),
                    lambda: rc.open("s3://acts/team/exp/run1", s3=opts)):
@@ -72,6 +72,7 @@ def test_flush_makes_objects_and_rotation(s3, lm):
         lm(toks)
     with rc.open("s3://acts/p/run2", s3=opts) as r:
         assert r.n_seq == 8 and r.header["n_files"] >= 3            # flush boundary + rotation
+        assert r.header["n_parts"] == 2                              # the explicit flush and the one at close
         assert len(keys(client, "acts", "p/run2.0")) == r.header["n_files"]
         assert torch.equal(torch.stack(r.tokens([4, 5, 6, 7])), toks)
 
@@ -79,7 +80,7 @@ def test_flush_makes_objects_and_rotation(s3, lm):
 def test_transcode_between_buckets_and_local(s3, lm, tmp_path):
     opts, client = s3
     toks = torch.randint(0, V, (5, 6))
-    with Sink("src", toy_layers(lm), "exact", bucket="acts", prefix="t", s3=opts) as sink:
+    with Sink("src", toy_layers(lm), "exact", bucket="acts", prefix="t", s3=opts):
         lm(toks)
     loc = {"bucket": "acts", "prefix": "t", "s3": opts}
     rc.transcode("src", "dst", "compact", src_loc=loc, dst_loc={"bucket": "acts2", "prefix": "out", "s3": opts})

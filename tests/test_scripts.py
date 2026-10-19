@@ -3,21 +3,21 @@ import json
 
 import pytest
 import torch
-
-import rescomp as rc
 from cli import main
 from corpus import pack_sequences
+
+import rescomp as rc
 
 
 def test_cli_info_and_eval(tiny_model, fake_tok, tmp_path, monkeypatch, capsys):
     toks = torch.randint(2, 256, (8, 10), generator=torch.Generator().manual_seed(0))
     stem = str(tmp_path / "c")
-    with rc.Sink(stem, rc.bind(tiny_model, [1, 3], tokenizer=fake_tok, model_id="tiny"), "int4_g16+layerK2") as sink:
+    with rc.Sink(stem, rc.bind(tiny_model, [1, 3], tokenizer=fake_tok, model_id="tiny"), "int4_g16+layerK2"):
         tiny_model(toks[:4])
         tiny_model(toks[4:])
     main(["info", stem])
     out = capsys.readouterr().out
-    assert "RSC3" in out and "layers [1, 3]" in out
+    assert "RSC4" in out and "layers [1, 3]" in out
     monkeypatch.setattr("rescomp.hf.load_model", lambda *a, **k: (tiny_model, fake_tok))
     main(["eval", stem, "--batch", "4", "--live", "--coherence", "--n-prompts", "1", "--n-new", "4", "--seeds", "2",
           "--out", str(tmp_path / "e.json")])

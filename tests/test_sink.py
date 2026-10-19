@@ -6,9 +6,7 @@ import rescomp as rc
 from rescomp.bf16_wrapper import choose_channels
 from rescomp.hooks import extract_tokens_generic
 from rescomp.sink import Sink
-from tests.test_generic import D, L, V, ToyLM
-
-ToyWithForward = ToyLM
+from tests.test_generic import D, L, ToyLM, V
 
 
 @pytest.fixture(scope="module")
@@ -61,7 +59,7 @@ def test_generation_style_calls_are_one_sequence(lm, tmp_path):
     stem = str(tmp_path / "gen")
     toks = torch.randint(0, V, (2, 6), generator=torch.Generator().manual_seed(1))
     spec = rc.Spec.parse("int8_tok+layerK2")
-    with Sink(stem, layers_of(lm), spec) as sink:
+    with Sink(stem, layers_of(lm), spec):
         lm(toks[:, :3])                               # prompt
         for t in range(3, 6):
             lm(toks[:, t: t + 1])                     # one new token per call, no cache signal: continuation by rule
@@ -81,7 +79,7 @@ def test_generation_style_calls_are_one_sequence(lm, tmp_path):
 def test_generation_keeps_per_call_chunks(lm, tmp_path):
     stem = str(tmp_path / "geninl")
     toks = torch.randint(0, V, (1, 5))
-    with Sink(stem, layers_of(lm), "bf16") as sink:
+    with Sink(stem, layers_of(lm), "bf16"):
         lm(toks[:, :2])
         lm(toks[:, 2:3])
         lm(toks[:, 3:4])
@@ -106,7 +104,7 @@ def test_explicit_tokens_and_tokens_off(lm, tmp_path):
 def test_without_root_module(lm, tmp_path):
     """A plain {layer: module} dict: no pre-hook, so no tokens; the first stored layer opens the call."""
     toks = torch.randint(0, V, (3, 4))
-    with Sink(str(tmp_path / "c"), {0: lm.blocks[0], 2: lm.blocks[2]}, "fp16") as sink:
+    with Sink(str(tmp_path / "c"), {0: lm.blocks[0], 2: lm.blocks[2]}, "fp16"):
         lm(toks)
         lm(toks[:2])
     with rc.open(str(tmp_path / "c")) as r:
@@ -189,8 +187,53 @@ def test_regimes_resolve_on_first_call(lm, tmp_path, regime, expect):
         assert f"(regime {regime})" in r.summary()
 
 
+def test_exact_regime_checks_fp16_range(tmp_path):
+    """`exact` is fp16: the Sink raises when a value of the model cannot be held exactly, unless told not to."""
+    class Scale(torch.nn.Module):
+        def __init__(self, k):
+            super().__init__()
+            self.k = k
+
+        def forward(self, x):
+            return x * self.k
+    model = torch.nn.Sequential(Scale(1.0), Scale(1e5))
+    x = torch.randn(2, 4, 32, generator=torch.Generator().manual_seed(0))
+    with Sink(str(tmp_path / "ok"), {0: model[0]}, "exact") as sink:
+        model(x)                                                      # within fp16's range
+    assert sink.check_exact and rc.open(str(tmp_path / "ok")).n_seq == 2
+    with pytest.raises(ValueError, match="exact regime .* layer\\(s\\) \\[1\\]"):
+        with Sink(str(tmp_path / "big"), {0: model[0], 1: model[1]}, "exact") as sink:
+            model(x)
+    with Sink(str(tmp_path / "off"), {0: model[0], 1: model[1]}, "exact", check_exact=False) as sink:
+        model(x)
+    assert rc.open(str(tmp_path / "off")).read(1, 0).abs().max() <= 65504
+    with Sink(str(tmp_path / "bf16"), {0: model[0], 1: model[1]}, "bf16") as sink:
+        model(x)                                                      # bf16 holds any magnitude
+    assert not sink.check_exact
+    # a bf16 model: every value must survive the fp16 cast, so a value below fp16's normal range is caught too
+    tiny = torch.full((1, 2, 32), 3e-8, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="exact regime"):
+        with Sink(str(tmp_path / "tiny"), {0: model[0]}, "exact") as sink:
+            model[0](tiny)
+    with Sink(str(tmp_path / "tiny32"), {0: model[0]}, "exact") as sink:
+        model[0](tiny.float())                                        # an fp32 model: fp16 rounding is accepted
+
+
+def test_overwrite_and_reserved_names_reach_the_sink(lm, tmp_path):
+    toks = torch.randint(0, V, (2, 4))
+    with Sink(str(tmp_path / "w"), layers_of(lm), "bf16") as sink:
+        lm(toks)
+        with pytest.raises(ValueError, match="reserved"):
+            sink.annotate(seq_id=[1, 2])
+    with pytest.raises(FileExistsError):
+        Sink(str(tmp_path / "w"), layers_of(lm), "bf16")
+    with Sink(str(tmp_path / "w"), layers_of(lm), "bf16", overwrite=True) as sink:
+        lm(toks[:1])
+    assert rc.open(str(tmp_path / "w")).n_seq == 1
+
+
 def test_regime_helpers():
-    from rescomp.regimes import resolve, needs_width, REGIMES
+    from rescomp.regimes import REGIMES, needs_width, resolve
     assert set(REGIMES) == {"exact", "faithful", "balanced", "compact"}
     assert resolve("compact", 4096).name == "int4_g512+layerK4+out32"
     assert resolve("balanced", 768).name == "int4_g96+layerK4+out8+key=bf16"

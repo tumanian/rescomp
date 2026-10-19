@@ -8,8 +8,8 @@ import pytest
 import torch
 
 import rescomp as rc
-from rescomp.bf16_wrapper import choose_channels
 from rescomp import lossless as LL
+from rescomp.bf16_wrapper import choose_channels
 from tests.conftest import make_acts
 
 GOLDEN = {

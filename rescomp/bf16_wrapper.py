@@ -17,7 +17,6 @@ is enough: the Sink measures each layer in its own hook on the first forward cal
 the decoder reads them from there. Nothing else is learned or fitted.
 """
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 
@@ -25,7 +24,7 @@ import torch
 @dataclass
 class OutlierChannels:
     """Per stored layer, the channel ids kept in bf16: ids is [L, n] int64, or None when the spec keeps none."""
-    ids: Optional[torch.Tensor] = None
+    ids: torch.Tensor | None = None
     source: str = "sample"
 
     def to_dict(self):

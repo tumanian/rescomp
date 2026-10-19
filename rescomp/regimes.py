@@ -3,7 +3,7 @@ with the model width d; a full spec string works anywhere a regime name does.
 
 | Regime     | Spec                                        | Measured on eight models (RESULTS.md)            |
 |------------|---------------------------------------------|--------------------------------------------------|
-| exact      | fp16                                        | 1.5x, bit-exact for bf16 models                  |
+| exact      | fp16                                        | 1.5x, bit-exact for bf16 values in fp16's range  |
 | faithful   | int8_tok+out8                               | 2.5x, <= 0.7% perplexity, per-layer KL ~ 0.001   |
 | balanced   | int4_g{d/8}+layerK4+out{d/128}+key=bf16     | 2.4-3.0x, every 4th layer exact, +1-2% perplexity|
 | compact    | int4_g{d/8}+layerK4+out{d/128}              | 5.0-5.2x, +4-7% perplexity (more on small models)|
@@ -11,7 +11,7 @@ with the model width d; a full spec string works anywhere a regime name does.
 from .spec import Spec
 
 REGIMES = {
-    "exact": ("fp16", "1.5x; bit-exact for bf16 models"),
+    "exact": ("fp16", "1.5x; bit-exact for bf16 values within fp16's range (the Sink checks every call)"),
     "faithful": ("int8_tok+out8", "2.5x; <= 0.7% perplexity; per-layer KL about 0.001"),
     "balanced": ("int4_g{G8}+layerK4+out{O2}+key=bf16", "2.4-3.0x; every 4th layer exact; +1-2% perplexity"),
     "compact": ("int4_g{G8}+layerK4+out{O2}", "5.0-5.2x; +4-7% perplexity, more on small models"),

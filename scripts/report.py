@@ -43,7 +43,7 @@ def table(path):
         fe, le = r["file_eval"], r.get("live_eval") or {}
         gen = path.parent / f"generations_{r.get('stem') or Path(r['file']).stem}.jsonl"
         co = coherence_from_generations(gen) if gen.exists() else {}
-        lines.append("| `%s` | %.2f | %.1e | %.4f | %.4f | %s | %s | %.3f | %s | %s | %s | %s |" % (
+        lines.append("| `{}` | {:.2f} | {:.1e} | {:.4f} | {:.4f} | {} | {} | {:.3f} | {} | {} | {} | {} |".format(
             r["spec"], r["ratio"], r["fidelity"]["rel_l2"], fe["kl_mean"], fe["ppl_ratio"],
             fmt(le.get("kl_mean"), ".4f"), fmt(le.get("ppl_ratio"), ".4f"), fe["top1_agree"],
             fmt(co.get("ppl_ratio"), ".3f"), fmt(co.get("t"), ".1f"),

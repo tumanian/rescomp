@@ -21,8 +21,8 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import rescomp as rc                                   # noqa: E402
-from rescomp.hf import load_model                      # noqa: E402
+import rescomp as rc  # noqa: E402
+from rescomp.hf import load_model  # noqa: E402
 
 TEXTS = [
     "The history of the Roman Empire begins with the founding of the city in the eighth century BC.",
@@ -78,7 +78,7 @@ def main():
             with rc.Sink(stem, rc.bind(model, a.layers, tokenizer=tok, model_id=a.model), regime, fidelity=True) as sink:
                 with torch.no_grad():
                     model(ids, attention_mask=mask, use_cache=False)
-                st = sink.stats()
+                sink.stats()
             with rc.open(stem) as r:
                 ok &= check(r.n_seq == len(TEXTS) and r.spec.name == rc.resolve_spec(regime, r.d).name, f"{r.n_seq} sequences, spec {r.spec.name}, ratio {r.header['bytes']['ratio_vs_bf16']:.2f}x")
                 toks = torch.stack(r.tokens())

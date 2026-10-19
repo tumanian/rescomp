@@ -16,7 +16,7 @@ encoder and the decoder, and the on-disk bytes are pinned to the library that do
 """
 import re
 from abc import abstractmethod
-from functools import lru_cache
+from functools import cache
 
 import torch
 from torchao.prototype.mx_formats import kernels as mxk
@@ -62,6 +62,16 @@ class Quantizer(Stage):
     @abstractmethod
     def decode(self, codes, S):
         ...
+
+
+def fp16_inexact(x):
+    """A 0-d bool on x's device: whether an fp16 cast loses what the model has. bf16 / fp16 inputs: any value that
+    changes (range, or bf16 values below fp16's normal range). Wider inputs: only values outside fp16's range
+    (above 65504 in magnitude, or non-zero and flushed to zero); rounding to fp16's mantissa is the cast's job."""
+    h = x.to(torch.float16).float()
+    if x.dtype in (torch.bfloat16, torch.float16):
+        return (h != x.float()).any()
+    return ((x.abs() > FP16_MAX) | ((x != 0) & (h == 0))).any()
 
 
 def _half_scale(amax, qmax):
@@ -185,7 +195,7 @@ class NVFP4(Quantizer):
         return x * (S[1].float() * S[0]).repeat_interleave(16, -1)
 
 
-@lru_cache(maxsize=None)
+@cache
 def quantizer(name):
     """Factory: the Quantizer for a name such as "int4_g512" (one instance per name)."""
     if not isinstance(name, str):

@@ -30,7 +30,7 @@ def test_decoder_blocks_and_info(tiny_model, fake_tok):
 
 def test_hooked_site_is_hidden_states(tiny_model, fake_tok, tmp_path):
     toks = torch.randint(2, 256, (3, 10))
-    with rc.Sink(str(tmp_path / "s"), rc.bind(tiny_model, [0, 2], tokenizer=fake_tok), "fp32") as sink:
+    with rc.Sink(str(tmp_path / "s"), rc.bind(tiny_model, [0, 2], tokenizer=fake_tok), "fp32"):
         tiny_model(toks)
     out = tiny_model(toks, output_hidden_states=True)
     with rc.open(str(tmp_path / "s")) as r:
@@ -42,7 +42,7 @@ def test_hooked_site_is_hidden_states(tiny_model, fake_tok, tmp_path):
 def test_moe_info(tiny_moe, fake_tok, tmp_path):
     assert H.HuggingFaceBinding(tiny_moe).moe_layers() == [0, 1]
     toks = torch.randint(2, 64, (3, 6))
-    with rc.Sink(str(tmp_path / "moe"), rc.bind(tiny_moe, [1], tokenizer=fake_tok), "fp16") as sink:
+    with rc.Sink(str(tmp_path / "moe"), rc.bind(tiny_moe, [1], tokenizer=fake_tok), "fp16"):
         tiny_moe(toks)
     with rc.open(str(tmp_path / "moe")) as r:
         cfg = r.header["model"]["config"]

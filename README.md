@@ -14,7 +14,7 @@ whose layers are `nn.Module`s.
 pip install -e .            # torch>=2.8, numpy, zstandard, pyarrow, torchao
 pip install -e '.[hf]'      # + transformers
 pip install -e '.[scripts]' # + datasets, for the scripts/ study and CLI
-pytest                      # ~155 tests, CPU only, under a minute
+pytest                      # 162 tests in about 10 s on a CPU (2 need CUDA or TransformerLens); ruff check .
 ```
 
 ## Use
@@ -60,7 +60,7 @@ r.tokens(2); r.header["model"]; r.header["layers"][1]["fidelity"]
   zstd stage; which parts run on the device and which on the host is its business, not yours. `codec.lossy` says
   which kind it is; `compile=True` runs the per-layer kernels through torch.compile (same bytes).
 
-### Storage (format 3), local or S3
+### Storage (format 4), local or S3
 
 A capture lives under a stem: a local path (`runs/demo`), an `s3://bucket/prefix/demo` URI, or a name with
 `bucket=` and `prefix=`; `Sink`, `Store`, `rc.open`/`Reader` and `rc.transcode` all take these. S3 goes through
@@ -75,10 +75,15 @@ r = rc.open("s3://my-acts/team/qwen3-8b/demo")
 ```
 
 `<stem>.00000.rsc, ...` hold only the compressed tensor blobs (append-only, rotated at `rotate_bytes`, 4 GB by
-default). `<stem>.meta.parquet` has the model, spec, outlier channels, stored layers with hook names and measured
-fidelity, and byte counts; `<stem>.chunks.parquet` which sequences each chunk holds and where; `<stem>.blobs.parquet`
-one row per blob (byte range, crc, dtype, shape); `<stem>.tokens.parquet` one row per sequence (tokens, mask,
-annotations).
+default). The tables come in parts, one per flush: `<stem>.chunks.00000.parquet` (which sequences each chunk holds
+and where), `<stem>.blobs.00000.parquet` (one row per blob: byte range, crc, dtype, shape) and
+`<stem>.tokens.00000.parquet` (one row per sequence: tokens, mask, annotations; a sequence touched by several
+flushes is in each, the last wins). `<stem>.meta.parquet` has the model, spec, outlier channels, stored layers with
+hook names and measured fidelity, byte counts, and the number of complete parts; it is written last at every flush
+(through a renamed temporary file locally), so a flush that fails part-way leaves the previous flush's capture
+readable, and each flush costs what it adds, not what the capture holds. A stem that already holds a capture is
+refused unless `overwrite=True`; annotation names cannot be `seq_id`, `n_tokens`, `tokens` or `mask`; a local
+capture's header records its stem's name, never a path.
 
 ### Lower level
 
@@ -128,7 +133,7 @@ outlier counts scale with the model width `d` (resolved when the sink sees its f
 
 | Regime | Spec | Keep in mind |
 |---|---|---|
-| `exact` | `fp16` | bit-exact for bf16 models |
+| `exact` | `fp16` | bit-exact for bf16 models whose values fit fp16's range; the Sink checks every call and raises otherwise (`bf16` is exact for any bf16 model, at a lower ratio) |
 | `faithful` | `int8_tok+out8` | every layer at single-layer KL ≈ 0.001 |
 | `balanced` | `int4_g(d/8)+layerK4+out(d/128)+key=bf16` | every 4th layer stored exactly; the rest at KL ≤ 0.005 |
 | `compact` | `int4_g(d/8)+layerK4+out(d/128)` | the 5× point; small models pay more |
@@ -206,5 +211,5 @@ tokenizer and forward hooks) live beside it; none of them is part of the library
 | `lossless.py` | `Lossless` stages (byte-shuffle + zstd), `lossless(record)` |
 | `bf16_wrapper.py` | what the quantizer does not touch: outlier channels and sink rows, kept in bf16, and how they are chosen |
 | `spec.py`, `regimes.py` | spec strings and the four regimes |
-| `store.py` | format 3 on disk or S3: `Store`, `Reader`, `transcode`, `location` |
+| `store.py` | format 4 on disk or S3: `Store`, `Reader`, `transcode`, `location` |
 | `instrument.py` | the separate regime: `Patcher`, `LiveCodec`, KL / perplexity / per-layer / coherence |
