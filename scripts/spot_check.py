@@ -8,6 +8,10 @@ to the input text, (2) the attention masks match, (3) the stored activations are
 `exact`, within the regime's error otherwise), (4) a generate() run with the KV cache stores the prompt plus the
 generated tokens in order, (5) re-encoding the hooked activations on the CPU gives the same bytes as the GPU
 encode for the exact regime and the keyframes (delta layers and nvfp4 may differ in the last bits).
+Then the TransformSink (--pooled, on by default): (6) the stored "last" rows are the last real token of the
+hooked activations bit for bit and the "mean" rows the masked mean within fp32 rounding (fp32 codec), the
+default "exact" codec rounds both to fp16, (7) Reader.pooled on a full capture gives the same rows, (8) a
+generate() run pools the prompt once and skips the cached steps.
 """
 import argparse
 import sys
@@ -53,6 +57,7 @@ def main():
     ap.add_argument("--model", default="gpt2")
     ap.add_argument("--layers", type=int, nargs="+", default=[8, 9, 10, 11])
     ap.add_argument("--regimes", nargs="*", default=["exact", "faithful", "balanced", "compact"])
+    ap.add_argument("--pooled", action=argparse.BooleanOptionalAction, default=True, help="also check the TransformSink")
     a = ap.parse_args()
     torch.manual_seed(0)
     model, tok = load_model(a.model)
@@ -108,8 +113,72 @@ def main():
                 ok &= check(torch.equal(r.tokens(0), out[0, :n].cpu()), "generate: stored tokens == prompt + generated tokens")
                 ok &= check(r.read(a.layers[-1], 0).shape[0] == n, f"generate: {n} stored positions")
                 print(f"       generated: {tok.decode(out[0])!r}")
+        if a.pooled:
+            ok &= check_pooled(model, tok, a, ids, mask, ref, d)
     print("ALL OK" if ok else "SOME CHECKS FAILED")
     return 0 if ok else 1
+
+
+def masked_rows(x, mask):
+    """[B, T, d], [B, T] -> (mean over real tokens, last real token), each [B, d], the slow way."""
+    means, lasts = [], []
+    for xi, mi in zip(x, mask.cpu().bool()):
+        real = xi[mi]
+        means.append(real.mean(0))
+        lasts.append(real[-1])
+    return torch.stack(means), torch.stack(lasts)
+
+
+def check_pooled(model, tok, a, ids, mask, ref, d):
+    """The TransformSink on the same texts: pooled rows vs the hooked activations, a full capture, generate()."""
+    ok = True
+    print("pooled rows (TransformSink)")
+    for codec in ("fp32", "exact"):
+        stem = f"{d}/pooled-{codec}"
+        with rc.TransformSink(stem, rc.bind(model, a.layers, tokenizer=tok, model_id=a.model), codec) as sink:
+            with torch.no_grad():
+                model(ids, attention_mask=mask, use_cache=False)
+            st = sink.stats()
+        with rc.open(stem) as r:
+            ok &= check(r.n_seq == len(TEXTS) and r.header["n_chunks"] == 1 and r.pooled_rows == ["mean", "last"]
+                        and r.header["site"] == "resid_post.mean+last", f"codec {codec}: {r.n_seq} sequences in {r.header['n_chunks']} chunk, rows {r.pooled_rows}, site {r.header['site']}")
+            ok &= check(torch.equal(torch.stack(r.tokens()), ids.cpu()), "stored token ids == tokenizer ids")
+            for l in a.layers:
+                mean, last = masked_rows(ref[l], mask)
+                got_mean, got_last = r.pooled(l, "mean"), r.pooled(l, "last")
+                if codec == "fp32":
+                    rel = ((got_mean - mean).norm() / mean.norm()).item()
+                    ok &= check(torch.equal(got_last, last), f"layer {l}: stored last rows == last real token of the hooked activations, bit for bit")
+                    ok &= check(rel < 1e-5, f"layer {l}: stored mean rows vs masked mean of the hooked activations: rel L2 {rel:.1e} (fp32 summation order)")
+                else:
+                    ok &= check(torch.equal(got_last, last.half().float()), f"layer {l}: exact (fp16) codec stores the last rows rounded to fp16")
+                    ok &= check(torch.equal(got_mean, got_mean.half().float()) and ((got_mean - mean).norm() / mean.norm()).item() < 2e-3,
+                                f"layer {l}: exact (fp16) codec stores the mean rows rounded to fp16")
+            if codec == "fp32":
+                full = f"{d}/full-fp32"
+                with rc.Sink(full, rc.bind(model, a.layers, tokenizer=tok), "fp32") as sink:
+                    with torch.no_grad():
+                        model(ids, attention_mask=mask, use_cache=False)
+                with rc.open(full) as f:
+                    same = all(torch.allclose(f.pooled(l, w), r.pooled(l, w), rtol=1e-5, atol=1e-4) for l in a.layers for w in ("mean", "last"))
+                    ok &= check(same, "Reader.pooled on the full capture == the TransformSink's rows (mean within fp32 rounding, last exact)")
+                    ok &= check(all(torch.equal(f.pooled(l, "last"), r.pooled(l, "last")) for l in a.layers), "  last rows bit for bit")
+    prompt = tok(TEXTS[0].split(",")[0], return_tensors="pt").to(model.get_input_embeddings().weight.device)
+    gstem = f"{d}/pooled-gen"
+    with rc.TransformSink(gstem, rc.bind(model, a.layers, tokenizer=tok), "fp32") as sink:
+        out = model.generate(**prompt, max_new_tokens=12, do_sample=False, pad_token_id=tok.pad_token_id)
+        st = sink.stats()
+    with rc.open(gstem) as r:
+        ok &= check(st["calls"] == 12 and st["skipped_calls"] == 11 and r.header["n_chunks"] == 1, f"generate: {st['calls']} forward calls, {st['skipped_calls']} skipped as cached steps, {r.header['n_chunks']} chunk")
+        ok &= check(torch.equal(r.tokens(0), prompt["input_ids"][0].cpu()), "generate: stored tokens == the prompt only")
+        pref = hooked(model, {l: decoder_blocks_of(model)[l] for l in a.layers}, prompt["input_ids"], None)
+        ok &= check(all(torch.equal(r.pooled(l, "last")[0], pref[l][0, -1]) for l in a.layers), "generate: last rows == last prompt token of a plain prompt forward")
+    return ok
+
+
+def decoder_blocks_of(model):
+    from rescomp.hf import decoder_blocks
+    return decoder_blocks(model)[0]
 
 
 if __name__ == "__main__":
