@@ -113,6 +113,8 @@ class _Walker:
 
     def reset(self):
         self.prev, self.expect = None, 0
+        if not hasattr(self, "_outl_cache"):
+            self._outl_cache = {}
 
     def _check(self, i, d=None):
         """Order and range checks; with d (encoder side) also the outlier ids and a fixed channel dim."""
@@ -129,7 +131,15 @@ class _Walker:
         self.expect = i + 1
 
     def _outl(self, i, dev):
-        return None if self.spec.outliers == 0 else self.calib.outliers[i].to(dev)
+        """Outlier channel ids for layer i on `dev`, copied once: a per-call host-to-device copy of a pageable
+        tensor is synchronous and would stall the CPU behind the GPU at every hooked layer."""
+        if self.spec.outliers == 0:
+            return None
+        key = (i, str(dev))
+        o = self._outl_cache.get(key)
+        if o is None:
+            o = self._outl_cache[key] = self.calib.outliers[i].to(dev)
+        return o
 
 
 class Encoder(_Walker):

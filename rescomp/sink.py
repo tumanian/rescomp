@@ -269,7 +269,9 @@ class Sink:
     def _calibrate_layer(self, i, x):
         v = x.float() if self.spec.is_key(i) else x.float() - self.enc.prev.to(x.device)
         energy = v.pow(2).sum(tuple(range(v.dim() - 1)))
-        self.calib.outliers[i] = energy.topk(self.spec.outliers).indices.sort().values.cpu()
+        ids = energy.topk(self.spec.outliers).indices.sort().values
+        self.enc._outl_cache[(i, str(x.device))] = ids          # the encoder uses this row from now on
+        self.calib.outliers[i] = ids.cpu()                      # first call only: one sync per layer
 
     def _write_buffer(self):
         """The slow part, off the forward path: move the encoded streams to the host, zstd + write each chunk."""
