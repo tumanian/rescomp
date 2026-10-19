@@ -14,10 +14,10 @@ from .hooks import Layers
 from .regimes import REGIMES
 from .regimes import resolve as resolve_spec
 from .sink import Sink
-from .transform_sink import TransformSink
-from .transforms import transform
 from .spec import Spec
 from .store import Reader, Store, is_capture, transcode
+from .transform_sink import TransformSink
+from .transforms import transform
 
 
 def open(stem, verify=True, bucket=None, prefix=None, s3=None):

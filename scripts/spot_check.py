@@ -166,7 +166,7 @@ def check_pooled(model, tok, a, ids, mask, ref, d):
     prompt = tok(TEXTS[0].split(",")[0], return_tensors="pt").to(model.get_input_embeddings().weight.device)
     gstem = f"{d}/pooled-gen"
     with rc.TransformSink(gstem, rc.bind(model, a.layers, tokenizer=tok), "fp32") as sink:
-        out = model.generate(**prompt, max_new_tokens=12, do_sample=False, pad_token_id=tok.pad_token_id)
+        model.generate(**prompt, max_new_tokens=12, do_sample=False, pad_token_id=tok.pad_token_id)
         st = sink.stats()
     with rc.open(gstem) as r:
         ok &= check(st["calls"] == 12 and st["skipped_calls"] == 11 and r.header["n_chunks"] == 1, f"generate: {st['calls']} forward calls, {st['skipped_calls']} skipped as cached steps, {r.header['n_chunks']} chunk")
