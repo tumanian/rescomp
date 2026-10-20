@@ -123,6 +123,9 @@ y = r.annotation("label")
   (a fixed 0.4-1.6 ms per hooked layer); memory is the accumulated rows only (k x d x 4 bytes per sequence per
   layer). Stored: 20 KB per sequence per layer on Qwen3-8B (13 KB with `exact`), 141x less than an `exact` full
   capture and 41x less than `compact`. DESIGN.md has the table.
+- `scripts/probes.py` trains logistic-regression probes (SST-2) on the pooled rows of a lossless full capture and
+  of a TransformSink capture and tests each on the other and on the lossy regimes: the two captures give the same
+  features bit for bit and the same predictions; RESULTS.md has the table.
 - `r.pooled(layer, "mean")` also works on a full capture from a `Sink`: the row is computed from the stored
   tokens with the attention mask, so a probe reads either kind of capture the same way.
 
