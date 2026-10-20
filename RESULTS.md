@@ -416,6 +416,23 @@ source; in brackets, agreement with the same probe's predictions on the lossless
 - Absolute accuracies (78-82% on GPT-2 small, 83-88% on Qwen3-1.7B) are what a linear probe with 2000 training
   sentences gives on SST-2; they are not the point here.
 
+Time to get a probe's features for all 2872 sentences, three layers by two rows (A10G; the script times each
+source the same way: open the capture, call `pooled()` for every layer and row; replay runs the model again with
+forward hooks and pools on the GPU, nothing stored):
+
+| Model | read the TransformSink capture | read the lossless full capture | replay the model | train one probe |
+|---|---|---|---|---|
+| GPT-2 | 0.36 s | 6.1 s (17x) | 1.4 s (4x) | 0.46 s |
+| Qwen3-1.7B | 0.65 s | 13.4 s (21x) | 10.5 s (16x) | 1.1 s |
+
+- **The pooled capture is the fastest source: 4-16x faster than replaying the model, 17-21x faster than reading
+  the full capture.** Replay grows with the model's forward cost, the pooled read with d only; on a model that
+  needs several GPUs the gap widens accordingly (see the large-model run below, when it is in).
+- Reading the full capture is slower than replaying a small model: it decodes every token of every sequence with
+  the CPU's zstd to pool two rows. A full capture pays off when the per-token activations are needed, not for
+  sequence-level probes.
+- Replayed features equal the lossless capture's (rel L2 0 on GPT-2, 1.5e-12 on Qwen3-1.7B).
+
 ## Summary
 
 - **A recipe's ratio is fixed; its cost is per model.** Across eight models from 124M to 30B parameters, dense
