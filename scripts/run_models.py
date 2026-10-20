@@ -1,4 +1,4 @@
-"""Capture one model once (exact), transcode to a ladder of specs, and measure each: ratio, rel L2, last-layer KL
+"""Capture one model once (exact; --base bf16 for a model whose residual stream exceeds fp16's range), transcode to a ladder of specs, and measure each: ratio, rel L2, last-layer KL
 (stored reconstruction), live chain KL (codec inside the forward pass), per-layer KL, and generation coherence.
 
     python scripts/run_models.py --model gpt2 --layers 8 9 10 11 --n-seq 128 --seq-len 256 --batch 16 \
@@ -57,6 +57,8 @@ def main():
     ap.add_argument("--bos", action="store_true")
     ap.add_argument("--dataset-split", default="train")
     ap.add_argument("--level", type=int, default=3)
+    ap.add_argument("--base", default="exact", help="codec of the base capture: exact (fp16, range-checked) or bf16 for a "
+                    "model whose residual stream exceeds fp16's range (Gemma-2)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--no-live", action="store_true")
     a = ap.parse_args()
@@ -78,7 +80,7 @@ def main():
     run = lambda t: model(t.to(dev), use_cache=False).logits
     base = str(out / "base")
     if not rc.is_capture(base):
-        with rc.Sink(base, L, rc.Codec("exact", level=a.level), extra={"corpus": f"wikitext-103-raw-v1 {a.dataset_split}", "seed": 0}), torch.no_grad():
+        with rc.Sink(base, L, rc.Codec(a.base, level=a.level), extra={"corpus": f"wikitext-103-raw-v1 {a.dataset_split}", "seed": 0}), torch.no_grad():
             for i in range(0, a.n_seq, a.batch):
                 model(tokens[i: i + a.batch].to(dev), use_cache=False)
         print(f"captured {base} in {time.time() - t0:.0f}s", flush=True)

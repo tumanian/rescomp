@@ -283,3 +283,18 @@ def test_transcode(tmp_path):
     assert rc.open(str(tmp_path / "x")).spec.name == "int4_g8+layerK4+out8"
     with pytest.raises(ValueError, match="resolve"):            # a regime needs the width before the first chunk
         rc.Store(str(tmp_path / "z"), model=MODEL, layers=LAYERS, codec="balanced").add_chunk([0], [0], [{}] * 4, None)
+
+
+def test_raise_inside_with_discards_unflushed(tmp_path):
+    """Nothing flushed and the body raises: no files remain, so the stem is free for a retry without overwrite."""
+    stem = str(tmp_path / "run")
+    acts = make_acts(L=4, B=2, T=8, d=64, seed=5)
+    with pytest.raises(RuntimeError, match="boom"):
+        with S.Store(stem, model=MODEL, layers=LAYERS, codec="bf16") as st:
+            ids = [st.new_sequence(torch.arange(8), mask=[1] * 8) for _ in range(2)]
+            st.add_chunk(ids, [0, 0], rc.Codec("bf16").encode(acts)[0], None)
+            raise RuntimeError("boom")
+    assert not S.is_capture(stem) and os.listdir(tmp_path) == []
+    with S.Store(stem, model=MODEL, layers=LAYERS, codec="bf16") as st:   # no overwrite guard in the way
+        pass
+    assert S.is_capture(stem)

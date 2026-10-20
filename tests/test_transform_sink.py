@@ -5,7 +5,7 @@ import torch
 
 import rescomp as rc
 from rescomp.transforms import Last, Mean, Stacked, transform
-from tests.test_generic import D, V, ToyLM
+from tests.test_generic import D, ToyLM, V
 from tests.test_sink import layers_of
 from tests.test_sink_hf import hidden
 
@@ -163,9 +163,9 @@ def test_pooled_on_a_full_capture_matches(lm, tmp_path):
     """The same forward through a Sink (every token) and a TransformSink: Reader.pooled gives the same rows."""
     toks = torch.randint(0, V, (4, 7), generator=torch.Generator().manual_seed(5))
     mask = random_mask(4, 7, 6, "left")
-    with rc.Sink(str(tmp_path / "full"), layers_of(lm), "fp32") as sink:
+    with rc.Sink(str(tmp_path / "full"), layers_of(lm), "fp32"):
         lm(toks, attention_mask=mask)
-    with rc.TransformSink(str(tmp_path / "pool"), layers_of(lm), "fp32") as sink:
+    with rc.TransformSink(str(tmp_path / "pool"), layers_of(lm), "fp32"):
         lm(toks, attention_mask=mask)
     with rc.open(str(tmp_path / "full")) as full, rc.open(str(tmp_path / "pool")) as pool:
         assert full.pooled_rows is None
@@ -182,7 +182,7 @@ def test_pooled_on_a_full_capture_matches(lm, tmp_path):
 def test_lossy_codec_chooses_channels_on_the_first_chunk(lm, tmp_path):
     stem = str(tmp_path / "lossy")
     toks = torch.randint(0, V, (6, 5))
-    with rc.TransformSink(stem, layers_of(lm), "int8_tok+out4", chunk_seqs=4, fidelity=True) as sink:
+    with rc.TransformSink(stem, layers_of(lm), "int8_tok+out4", chunk_seqs=4, fidelity=True):
         lm(toks[:4])
         lm(toks[4:])
     with rc.open(stem) as r:

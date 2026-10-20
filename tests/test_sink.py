@@ -204,6 +204,7 @@ def test_exact_regime_checks_fp16_range(tmp_path):
     with pytest.raises(ValueError, match="exact regime .* layer\\(s\\) \\[1\\]"):
         with Sink(str(tmp_path / "big"), {0: model[0], 1: model[1]}, "exact") as sink:
             model(x)
+    assert not rc.is_capture(str(tmp_path / "big")) and not list(tmp_path.glob("big.*"))   # nothing half-written
     with Sink(str(tmp_path / "off"), {0: model[0], 1: model[1]}, "exact", check_exact=False) as sink:
         model(x)
     assert rc.open(str(tmp_path / "off")).read(1, 0).abs().max() <= 65504
@@ -243,3 +244,26 @@ def test_regime_helpers():
         resolve("compact")
     with pytest.raises(ValueError):
         resolve("nonsense")
+
+
+def test_raise_inside_with_discards_unflushed(lm, tmp_path):
+    """A `with` body that raises leaves the stem as the last flush published it, or without a capture at all."""
+    toks = torch.randint(0, V, (4, 9), generator=torch.Generator().manual_seed(1))
+    stem = str(tmp_path / "none")
+    with pytest.raises(RuntimeError, match="boom"):
+        with Sink(stem, layers_of(lm), "bf16"):
+            lm(toks)
+            raise RuntimeError("boom")
+    assert not rc.is_capture(stem) and not list(tmp_path.glob("none.*"))
+    stem = str(tmp_path / "part")
+    with pytest.raises(RuntimeError):
+        with Sink(stem, layers_of(lm), "bf16") as sink:
+            lm(toks[:3])
+            sink.flush()
+            lm(toks[3:])
+            raise RuntimeError("boom")
+    with rc.open(stem) as r:
+        assert r.n_seq == 3 and r.header["n_chunks"] == 1
+    with Sink(str(tmp_path / "after"), layers_of(lm), "bf16"):
+        lm(toks)                                                      # the hooks came off: this records 4 sequences
+    assert rc.open(str(tmp_path / "after")).n_seq == 4
