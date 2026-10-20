@@ -155,10 +155,16 @@ def main():
     t0 = time.time()
     stems = {FULL: str(out / "full-lossless"), POOLED: str(out / "pooled")}
     capture(model, tok, items, [rc.Sink(stems[FULL], bind(), a.lossless), rc.TransformSink(stems[POOLED], bind())], a.batch, dev)
+    t_cap = {"lossless + TransformSink": time.time() - t0}
+    t0 = time.time()
+    capture(model, tok, items, [rc.TransformSink(str(out / "pooled-alone"), bind())], a.batch, dev)
+    t_cap["TransformSink alone"] = time.time() - t0
     for regime in a.regimes:
         stems[f"full {regime}"] = str(out / f"full-{regime}")
+        t0 = time.time()
         capture(model, tok, items, [rc.Sink(stems[f"full {regime}"], bind(), regime)], a.batch, dev)
-    print(f"captured in {time.time() - t0:.0f} s")
+        t_cap[regime] = time.time() - t0
+    print("captured in " + ", ".join(f"{k} {v:.0f} s" for k, v in t_cap.items()))
     feats, info, t_feat = {}, {}, {}
     for src, stem in stems.items():
         t0 = time.time()
@@ -216,6 +222,8 @@ def main():
     for src in (POOLED, FULL):
         lines.append(f"| read {src} | {t_feat[src]:.2f} | {t_feat[src] / t_feat[POOLED]:.0f}x |")
     lines.append(f"| replay the model ({dev}, batch {a.batch}) | {t_replay:.2f} | {t_replay / t_feat[POOLED]:.0f}x |")
+    lines.append("\nCapture passes (one forward over all sentences each, the sinks attached; flush and close included): "
+                 + ", ".join(f"{k} {v:.1f} s" for k, v in t_cap.items()) + ".")
     lines.append(f"\n(replayed features vs the lossless capture's: rel L2 {rep_err:.1e}; the lossy captures read in "
                  + ", ".join(f"{t_feat[s]:.2f} s" for s in stems if s not in (POOLED, FULL)) + ")")
     text = "\n".join(lines)
