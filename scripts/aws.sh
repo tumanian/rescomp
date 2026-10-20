@@ -64,7 +64,7 @@ case $cmd in
         --block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=${DISK_GB:-200},VolumeType=gp3,DeleteOnTermination=true}" \
         --user-data file://$HERE/scripts/bootstrap.sh \
         --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=rescomp-$BOX}]" \
-        --query 'Instances[0].InstanceId' --output text 2>/dev/null) && break || echo "no capacity in $SUBNET"
+        --query 'Instances[0].InstanceId' --output text 2>"$STATE.err") && break || echo "$SUBNET: $(grep -o 'An error.*' "$STATE.err" | cut -c1-200)"
     done
     [ -n "$ID" ] || { echo "no capacity in any AZ for ${ITYPE:-g6e.xlarge}"; exit 1; }
     echo "$ID" > "$STATE.id"
