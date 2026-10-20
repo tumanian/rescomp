@@ -1,0 +1,43 @@
+{
+ "out": "results/saelens_gpt2",
+ "model": "gpt2",
+ "layer": 7,
+ "dataset": "apollo-research/Skylion007-openwebtext-tokenizer-gpt2",
+ "dataset_column": "input_ids",
+ "context": 128,
+ "train_tokens": 20000000,
+ "eval_tokens": 500000,
+ "arms": [
+  "faithful",
+  "balanced",
+  "compact"
+ ],
+ "capture_layers": null,
+ "seeds": [
+  0,
+  1,
+  2
+ ],
+ "d_sae_mult": 16,
+ "k": 32,
+ "lr": 0.0003,
+ "batch_tokens": 4096,
+ "buffer_tokens": 262144,
+ "forward_batch": 128,
+ "eval_batch": 32,
+ "level": 3,
+ "device": "cuda",
+ "smoke": false,
+ "hook": "blocks.7.hook_resid_post",
+ "arms_run": [
+  "baseline",
+  "faithful",
+  "balanced",
+  "compact"
+ ],
+ "pass_rule": {
+  "delta_ce_floor_nats": 0.005,
+  "fve_floor": 0.002,
+  "feature_match_slack": 0.01
+ }
+}
