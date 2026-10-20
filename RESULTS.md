@@ -418,20 +418,28 @@ source; in brackets, agreement with the same probe's predictions on the lossless
 
 Time to get a probe's features for all 2872 sentences, three layers by two rows (A10G; the script times each
 source the same way: open the capture, call `pooled()` for every layer and row; replay runs the model again with
-forward hooks and pools on the GPU, nothing stored):
+forward hooks and pools on the GPU, nothing stored). Qwen3-8B, layers 18, 27, 35, was run the same way on the same
+box (2026-10-20), after no larger GPU box could be had in us-west-2 overnight:
 
-| Model | read the TransformSink capture | read the lossless full capture | replay the model | train one probe |
-|---|---|---|---|---|
-| GPT-2 | 0.36 s | 6.1 s (17x) | 1.4 s (4x) | 0.46 s |
-| Qwen3-1.7B | 0.65 s | 13.4 s (21x) | 10.5 s (16x) | 1.1 s |
+| Model | read the TransformSink capture | read the lossless full capture | replay the model | capture once (TransformSink alone) | train one probe |
+|---|---|---|---|---|---|
+| GPT-2 | 0.36 s | 6.1 s (17x) | 1.4 s (4x) | - | 0.46 s |
+| Qwen3-1.7B | 0.65 s | 13.4 s (21x) | 10.5 s (16x) | - | 1.1 s |
+| Qwen3-8B | 1.1 s | 25.4 s (23x) | 36.8 s (33x) | 38.7 s | 4.9 s |
 
-- **The pooled capture is the fastest source: 4-16x faster than replaying the model, 17-21x faster than reading
-  the full capture.** Replay grows with the model's forward cost, the pooled read with d only; on a model that
-  needs several GPUs the gap widens accordingly (see the large-model run below, when it is in).
+- **The pooled capture is the fastest source, and its lead grows with the model: 4x faster than replaying GPT-2,
+  16x for Qwen3-1.7B, 33x for Qwen3-8B.** Replay costs a forward pass of the model; reading the pooled rows costs
+  only their bytes (proportional to d), so the gap keeps widening on larger models.
+- **The capture pays for itself on the first reuse.** Capturing with a TransformSink costs one forward pass with
+  the hooks on (38.7 s on Qwen3-8B, about one replay); every later probe session, a new layer choice or a new
+  label set on the same sentences then takes about 1 s instead of 37 s, and needs no GPU or model at all.
 - Reading the full capture is slower than replaying a small model: it decodes every token of every sequence with
   the CPU's zstd to pool two rows. A full capture pays off when the per-token activations are needed, not for
   sequence-level probes.
-- Replayed features equal the lossless capture's (rel L2 0 on GPT-2, 1.5e-12 on Qwen3-1.7B).
+- Qwen3-8B probes behave like the other two: the TransformSink's rows equal the lossless pooled rows (rel L2 0,
+  one mean at 2e-12) with 100% prediction agreement; the lossy captures cost at most 0.9 points (layer 35: 91.4%
+  -> 90.5% balanced, 90.7% compact), at 97-100% agreement. Full table: `results/probes/Qwen-Qwen3-8B.md`.
+- Replayed features equal the lossless capture's (rel L2 0 on GPT-2, 1.5e-12 on Qwen3-1.7B, 6e-11 on Qwen3-8B).
 
 ## Summary
 
