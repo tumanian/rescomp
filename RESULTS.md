@@ -407,7 +407,7 @@ source; in brackets, agreement with the same probe's predictions on the lossless
   at the 256-512 token sequences of the overhead table) and the full capture interchangeably.
 - **Lossy full captures work for probes on keyframe and middle layers; the last layer of GPT-2 does not.** On
   the keyframe layer `balanced` is exact (bf16 keyframes) and `compact` costs at most 2 points (93-97% agreement).
-  On the int4 delta layers of Qwen3-1.7B the probes keep their accuracy within 1 point (92-99% agreement) even at
+  On the int4 delta layers of Qwen3-1.7B the probes keep their accuracy within 1.2 points (92-99% agreement) even at
   rel L2 0.1-0.13 on the last-token rows. GPT-2's last layer is the exception: rel L2 7e-2 on the last-token
   rows costs the probe trained on lossless features 7-9 points (81.9% → 74.5 / 72.9%, 80% agreement), the mean
   probe 1-2 points. Mean rows average the error out; last-token rows carry it whole, and GPT-2's final residual
@@ -422,20 +422,23 @@ forward hooks and pools on the GPU, nothing stored). Sizes are what each capture
 three layers; the ratios of the full captures are against the raw bf16 size of the same activations (which counts
 the padded positions, as the stored captures do), the pooled capture's against that same raw size, i.e. how much
 smaller it is than keeping every token uncompressed. Read and replay times are in seconds, with the factor against
-reading the pooled capture in brackets. Training one probe on 2000 sentences takes 0.5-6 s. The capture pass was not timed on its own in
+reading the pooled capture in brackets. Training one probe on 2000 sentences takes 0.5-6 s. Probe accuracy is SST-2
+test accuracy (872 validation sentences) of the best of the six probes (three layers, mean or last-token row); the
+pooled rows give exactly the lossless capture's accuracy on every layer and row, on all five models. The last
+column is the largest loss of a probe trained on lossless features and tested on a lossy capture's, over all six. The capture pass was not timed on its own in
 the GPT-2 and Qwen3-1.7B runs. Qwen3-8B (layers 18,
 27, 35) ran the same way on the same box
 on 2026-10-20; Qwen3-32B (layers 32, 48, 63) on a g6.12xlarge (4 x L4) and Qwen2.5-72B (layers 40, 60, 79) on a
 g5.48xlarge (8 x A10G), each model spread over its box's GPUs. Those were the largest boxes AWS had free in us-west-2
 that night: the 384-768 GB boxes meant for Qwen3-235B-A22B were out of capacity in all four zones from 22:22 to 06:00.
 
-| Model | GPUs | raw bf16 activations | lossless full capture | compact full capture | pooled capture | read pooled | read full | replay the model | capture once (TransformSink) |
-|---|---|---|---|---|---|---|---|---|---|
-| GPT-2 | 1 A10G | 534 MB | 310 MB (1.72x) | 66 MB (8.06x) | 28 MB (19x) | 0.36 s | 6.10 s (17x) | 1.44 s (4x) | - |
-| Qwen3-1.7B | 1 A10G | 1.40 GB | 920 MB (1.52x) | 250 MB (5.58x) | 75 MB (19x) | 0.65 s | 13.4 s (21x) | 10.5 s (16x) | - |
-| Qwen3-8B | 1 A10G | 2.80 GB | 1.84 GB (1.52x) | 500 MB (5.59x) | 146 MB (19x) | 1.11 s | 25.4 s (23x) | 36.8 s (33x) | 38.7 s |
-| Qwen3-32B | 4 L4 | 3.50 GB | 2.30 GB (1.52x) | 608 MB (5.74x) | 178 MB (20x) | 1.15 s | 33.9 s (29x) | 152.9 s (133x) | 154.6 s |
-| Qwen2.5-72B | 8 A10G | 5.59 GB | 3.54 GB (1.58x) | 723 MB (7.73x) | 279 MB (20x) | 2.54 s | 69.2 s (27x) | 286.2 s (113x) | 289.5 s |
+| Model | GPUs | raw bf16 activations | lossless full capture | compact full capture | pooled capture | read pooled | read full | replay the model | capture once (TransformSink) | probe accuracy, pooled = lossless (best layer) | largest drop on balanced / compact |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| GPT-2 | 1 A10G | 534 MB | 310 MB (1.72x) | 66 MB (8.06x) | 28 MB (19x) | 0.36 s | 6.10 s (17x) | 1.44 s (4x) | - | 81.9% (L11 last) | 7.4 / 9.0 pt (L11 last) |
+| Qwen3-1.7B | 1 A10G | 1.40 GB | 920 MB (1.52x) | 250 MB (5.58x) | 75 MB (19x) | 0.65 s | 13.4 s (21x) | 10.5 s (16x) | - | 88.3% (L14 mean) | 1.1 / 1.2 pt (L21 last) |
+| Qwen3-8B | 1 A10G | 2.80 GB | 1.84 GB (1.52x) | 500 MB (5.59x) | 146 MB (19x) | 1.11 s | 25.4 s (23x) | 36.8 s (33x) | 38.7 s | 92.9% (L27 last) | 0.9 / 0.8 pt (L35) |
+| Qwen3-32B | 4 L4 | 3.50 GB | 2.30 GB (1.52x) | 608 MB (5.74x) | 178 MB (20x) | 1.15 s | 33.9 s (29x) | 152.9 s (133x) | 154.6 s | 94.3% (L48 last) | 0.8 / 0.7 pt (L63 last) |
+| Qwen2.5-72B | 8 A10G | 5.59 GB | 3.54 GB (1.58x) | 723 MB (7.73x) | 279 MB (20x) | 2.54 s | 69.2 s (27x) | 286.2 s (113x) | 289.5 s | 96.1% (L60 last) | 0.2 / 0.5 pt (L79 last) |
 
 - **The pooled capture is the fastest source, and its lead grows with the model: 4x faster than replaying GPT-2,
   16x for Qwen3-1.7B, 33x for Qwen3-8B, 113-133x for Qwen3-32B and Qwen2.5-72B.** Replay costs a forward pass of
