@@ -362,46 +362,59 @@ hybrid 0 on both keyframes and ≤ 0.004 between; `int8_tok` and `uabs` ≤ 0.00
 
 ## Probes on pooled rows (2026-10-19)
 
-`scripts/probes.py`: SST-2 sentences (2000 train, the 872 validation sentences as test) through GPT-2 small with a
-lossless full `Sink` and a `TransformSink` (fp32, `mean+last`) attached to the same forward, then once more per
-lossy regime. From every capture `Reader.pooled(layer, row)` gives one vector per sentence: the full captures
-compute it from the stored tokens with the attention mask, the TransformSink stored it. A logistic-regression probe
-(L-BFGS, standardized features, small L2) per layer and row is trained on the lossless features and on the
-TransformSink's, and tested on every capture's features. Run on the CPU in fp32 (the GPU box's session had
-expired), so the lossless capture is the `fp32` codec; on a bf16 model it would be `exact`. Stored layers 6, 9, 11:
-layer 6 is the keyframe of both lossy regimes, 9 and 11 are int4 delta layers in both, which is why their errors agree.
+`scripts/probes.py`, on the A10G box: SST-2 sentences (2000 train, the 872 validation sentences as test) through
+a bf16 model with a lossless full `Sink` (`exact`, an fp16 cast: bit-exact for bf16 activations) and a
+`TransformSink` (fp32, `mean+last`) attached to the same forward, then once more per lossy regime. From every
+capture `Reader.pooled(layer, row)` gives one vector per sentence: the full captures compute it from the stored
+tokens with the attention mask, the TransformSink stored it. A logistic-regression probe (L-BFGS, standardized
+features, small L2) per layer and row is trained on the lossless features and on the TransformSink's, and tested on
+every capture's features. Three stored layers per model, so layer 6 (GPT-2) / 14 (Qwen3-1.7B) is the keyframe of
+both lossy regimes and the other two are int4 delta layers in both, which is why their errors agree. (A first run
+on the CPU in fp32 with an fp32 lossless codec gave the same picture within a point.)
 
-| Capture | spec | stored | note |
-|---|---|---|---|
-| full fp32 | `fp32` | 866 MB | the lossless reference |
-| TransformSink | `fp32` | 46 MB | 19x smaller: two rows per sentence instead of every token |
-| full balanced | `int4_g96+layerK4+out8+key=bf16` | 150 MB | ratios here are inflated by the padded positions |
-| full compact | `int4_g96+layerK4+out8` | 63 MB | |
+| Model | capture | spec | stored | note |
+|---|---|---|---|---|
+| GPT-2, layers 6 9 11 | full exact | `fp16` | 311 MB | the lossless reference |
+| | TransformSink | `fp32` | 29 MB | 11x smaller: two rows per sentence instead of every token |
+| | full balanced | `int4_g96+layerK4+out8+key=bf16` | 153 MB | ratios of the full captures are inflated by the padded positions |
+| | full compact | `int4_g96+layerK4+out8` | 66 MB | |
+| Qwen3-1.7B, layers 14 21 27 | full exact | `fp16` | 921 MB | |
+| | TransformSink | `fp32` | 75 MB | 12x smaller |
+| | full balanced | `int4_g256+layerK4+out16+key=bf16` | 495 MB | |
+| | full compact | `int4_g256+layerK4+out16` | 250 MB | |
 
 Feature error against the lossless full capture (rel L2 over the test set) and probe accuracy (train source → test
 source; in brackets, agreement with the same probe's predictions on the lossless features):
 
-| Layer | row | TransformSink err | balanced err | compact err | lossless → lossless | lossless → TransformSink | lossless → balanced | lossless → compact | TransformSink → lossless |
-|---|---|---|---|---|---|---|---|---|---|
-| 6 | mean | 0 | 1.3e-03 | 9.3e-03 | 80.3% | 80.3% (100%) | 80.2% (99.9%) | 80.3% (97.0%) | 80.3% |
-| 6 | last | 0 | 1.7e-03 | 1.2e-01 | 81.3% | 81.3% (100%) | 81.3% (100%) | 80.4% (93.6%) | 81.3% |
-| 9 | mean | 0 | 5.7e-03 | 5.7e-03 | 79.1% | 79.1% (100%) | 79.5% (98.5%) | 80.0% (98.2%) | 79.1% |
-| 9 | last | 0 | 3.9e-02 | 4.0e-02 | 80.8% | 80.8% (100%) | 81.2% (96.9%) | 81.1% (96.6%) | 80.8% |
-| 11 | mean | 0 | 3.3e-02 | 3.3e-02 | 78.2% | 78.2% (100%) | 76.9% (89.3%) | 77.3% (89.4%) | 78.2% |
-| 11 | last | 0 | 7.4e-02 | 7.4e-02 | 81.8% | 81.8% (100%) | 73.5% (80.3%) | 73.5% (80.7%) | 81.8% |
+| Model | layer | row | TransformSink err | balanced err | compact err | lossless → lossless | lossless → TransformSink | lossless → balanced | lossless → compact | TransformSink → lossless |
+|---|---|---|---|---|---|---|---|---|---|---|
+| GPT-2 | 6 | mean | 0 | 0 | 9.3e-03 | 79.9% | 79.9% (100%) | 79.9% (100%) | 80.4% (96.6%) | 79.9% |
+| | 6 | last | 0 | 0 | 1.2e-01 | 81.4% | 81.4% (100%) | 81.4% (100%) | 79.6% (92.7%) | 81.4% |
+| | 9 | mean | 0 | 5.7e-03 | 5.8e-03 | 79.2% | 79.2% (100%) | 78.6% (98.4%) | 79.1% (98.5%) | 79.2% |
+| | 9 | last | 0 | 4.0e-02 | 4.0e-02 | 81.3% | 81.3% (100%) | 81.5% (96.6%) | 80.7% (97.1%) | 81.3% |
+| | 11 | mean | 0 | 3.3e-02 | 3.3e-02 | 78.4% | 78.4% (100%) | 75.9% (88.8%) | 77.2% (88.2%) | 78.4% |
+| | 11 | last | 0 | 7.4e-02 | 7.4e-02 | 81.9% | 81.9% (100%) | 74.5% (81.0%) | 72.9% (80.3%) | 81.9% |
+| Qwen3-1.7B | 14 | mean | 0 | 0 | 9.2e-03 | 88.3% | 88.3% (100%) | 88.3% (100%) | 88.1% (97.2%) | 88.3% |
+| | 14 | last | 0 | 0 | 1.7e-01 | 87.3% | 87.3% (100%) | 87.3% (100%) | 86.7% (95.3%) | 87.3% |
+| | 21 | mean | 6e-12 | 1.7e-02 | 1.7e-02 | 83.7% | 83.7% (100%) | 84.1% (99.0%) | 83.9% (98.2%) | 83.7% |
+| | 21 | last | 0 | 1.1e-01 | 1.1e-01 | 87.3% | 87.3% (100%) | 86.2% (95.3%) | 86.1% (96.1%) | 87.3% |
+| | 27 | mean | 0 | 3.3e-02 | 3.3e-02 | 82.7% | 82.7% (100%) | 83.5% (97.8%) | 82.7% (97.7%) | 82.7% |
+| | 27 | last | 0 | 1.3e-01 | 1.3e-01 | 85.8% | 85.8% (100%) | 85.7% (92.8%) | 86.4% (92.3%) | 85.8% |
 
-- **The TransformSink's rows are the lossless capture's pooled rows, bit for bit** (error 0 on every layer and
-  row, on the CPU; on a GPU the mean's summation order can differ in the last bits). A probe trained on either
-  capture gives the same predictions on the other, so a probe study can use the 19x smaller pooled capture
-  (100-300x smaller at the sequence lengths of the overhead table) and the full capture interchangeably.
-- **Lossy full captures work for probes on early and middle layers, not on the last one.** At layers 6 and 9 a
-  probe trained on lossless features keeps its accuracy on `balanced` and `compact` features (within 1 point,
-  97-100% agreement). At layer 11, GPT-2's last layer, the int4 delta error (rel L2 3e-2 on means, 7e-2 on last
-  tokens) costs the last-token probe 8 points (81.8% → 73.5%, 80% agreement) and the mean probe 1 point. Mean
-  rows average the error out; last-token rows carry it whole. A probe on a compressed capture should either be
-  trained on the same capture or use a keyframe layer.
-- Absolute accuracies (78-82%) are what a linear probe on GPT-2 small's residual stream gives on SST-2 with 2000
-  training sentences; they are not the point here.
+- **The TransformSink's rows are the lossless capture's pooled rows, bit for bit** on both models (error 0 on
+  every layer and row but one mean at 6e-12, the GPU's summation order). A probe trained on either capture gives
+  the same predictions on the other, so a probe study can use the 11-12x smaller pooled capture (100-300x smaller
+  at the sequence lengths of the overhead table) and the full capture interchangeably.
+- **Lossy full captures work for probes on keyframe and middle layers; the last layer of GPT-2 does not.** On
+  the keyframe layer `balanced` is exact (bf16 keyframes) and `compact` costs at most 2 points (93-97% agreement).
+  On the int4 delta layers of Qwen3-1.7B the probes keep their accuracy within 1 point (92-99% agreement) even at
+  rel L2 0.1-0.13 on the last-token rows. GPT-2's last layer is the exception: rel L2 7e-2 on the last-token
+  rows costs the probe trained on lossless features 7-9 points (81.9% → 74.5 / 72.9%, 80% agreement), the mean
+  probe 1-2 points. Mean rows average the error out; last-token rows carry it whole, and GPT-2's final residual
+  stream is the hardest to quantize (its per-layer KL is the largest in the tables above). A probe on a compressed
+  capture of a last layer should be trained on that capture or use a keyframe layer.
+- Absolute accuracies (78-82% on GPT-2 small, 83-88% on Qwen3-1.7B) are what a linear probe with 2000 training
+  sentences gives on SST-2; they are not the point here.
 
 ## Summary
 
