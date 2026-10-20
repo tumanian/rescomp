@@ -26,7 +26,7 @@ A probe wants one vector per sequence, not one per token. `rc.TransformSink` hoo
 below but stores only a few rows per sequence: the mean over the real tokens and the last real token. Measured on
 SST-2 (RESULTS.md): the rows equal a lossless full capture's pooled rows bit for bit, probes trained on either
 give the same predictions, the capture is 11-12x smaller than the full one on short sentences (70-140x at 256-512
-tokens), and reading it is 4x (GPT-2) to 133x (Qwen3-32B) faster than replaying the model to get the same
+tokens), and reading it is 4x (GPT-2) to 113x (Qwen2.5-72B) faster than replaying the model to get the same
 features. `model` and `tok` are
 loaded as in the Sink example below.
 

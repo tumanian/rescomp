@@ -419,8 +419,9 @@ source; in brackets, agreement with the same probe's predictions on the lossless
 Time to get a probe's features for all 2872 sentences, three layers by two rows (A10G; the script times each
 source the same way: open the capture, call `pooled()` for every layer and row; replay runs the model again with
 forward hooks and pools on the GPU, nothing stored). Qwen3-8B (layers 18, 27, 35) ran the same way on the same box
-on 2026-10-20; Qwen3-32B (layers 32, 48, 63) on a g6.12xlarge (4 x L4, the model spread over them), the largest box
-AWS had free in us-west-2 that night (every larger G box was out of capacity in all four zones for hours):
+on 2026-10-20; Qwen3-32B (layers 32, 48, 63) on a g6.12xlarge (4 x L4) and Qwen2.5-72B (layers 40, 60, 79) on a
+g5.48xlarge (8 x A10G), each model spread over its box's GPUs. Those were the largest boxes AWS had free in us-west-2
+that night: the 384-768 GB boxes meant for Qwen3-235B-A22B were out of capacity in all four zones from 22:22 to 06:00.
 
 | Model | read the TransformSink capture | read the lossless full capture | replay the model | capture once (TransformSink alone) | train one probe |
 |---|---|---|---|---|---|
@@ -428,15 +429,18 @@ AWS had free in us-west-2 that night (every larger G box was out of capacity in 
 | Qwen3-1.7B | 0.65 s | 13.4 s (21x) | 10.5 s (16x) | - | 1.1 s |
 | Qwen3-8B | 1.1 s | 25.4 s (23x) | 36.8 s (33x) | 38.7 s | 4.9 s |
 | Qwen3-32B (4 x L4) | 1.15 s | 33.9 s (30x) | 152.9 s (133x) | 154.6 s | 0.9 s |
+| Qwen2.5-72B (8 x A10G) | 2.5 s | 69.3 s (27x) | 286.2 s (113x) | 289.5 s | 6.3 s |
 
 - **The pooled capture is the fastest source, and its lead grows with the model: 4x faster than replaying GPT-2,
-  16x for Qwen3-1.7B, 33x for Qwen3-8B, 133x for Qwen3-32B.** Replay costs a forward pass of the model; reading
-  the pooled rows costs only their bytes (proportional to d: 1.15 s for a 32B model with d = 5120), so the gap
-  keeps widening on larger models. The 32B number is on slower GPUs (L4) and a model split over four of them,
-  which makes its replay slower than an A10G-class single GPU would; the trend does not depend on it.
+  16x for Qwen3-1.7B, 33x for Qwen3-8B, 113-133x for Qwen3-32B and Qwen2.5-72B.** Replay costs a forward pass of
+  the model; reading the pooled rows costs only their bytes (proportional to d: 2.5 s for a 72B model with
+  d = 8192), so the gap keeps widening with model size. The two large models ran split over several GPUs (a
+  pipeline, one GPU busy at a time), the 32B on slower L4s, which is why it shows a larger ratio than the 72B on
+  A10Gs; on either, a probe's features take seconds from the pooled capture and minutes from the model.
 - **The capture pays for itself on the first reuse.** Capturing with a TransformSink costs one forward pass with
-  the hooks on (38.7 s on Qwen3-8B, 155 s on Qwen3-32B: about one replay each); every later probe session, a new
-  layer choice or a new label set on the same sentences then takes about 1 s, and needs no GPU or model at all.
+  the hooks on (38.7 s on Qwen3-8B, 155 s on Qwen3-32B, 290 s on Qwen2.5-72B: about one replay each); every later
+  probe session, a new layer choice or a new label set on the same sentences then takes 1-3 s, and needs no GPU or
+  model at all (the 72B needs eight GPUs to replay).
 - Reading the full capture is slower than replaying a small model: it decodes every token of every sequence with
   the CPU's zstd to pool two rows. A full capture pays off when the per-token activations are needed, not for
   sequence-level probes.
@@ -446,9 +450,13 @@ AWS had free in us-west-2 that night (every larger G box was out of capacity in 
   Qwen3-32B the same: 100% agreement between the pooled and the lossless rows (one mean at 8e-12), lossy captures
   within 0.9 points (layer 63 last token: 93.2% -> 92.4% balanced, 92.5% compact), 98-100% agreement; the
   TransformSink capture is 178 MB against 2.3 GB for the lossless full capture. Full table:
-  `results/probes/Qwen-Qwen3-32B.md`.
+  `results/probes/Qwen-Qwen3-32B.md`. Qwen2.5-72B too: 100% agreement (one mean at 6e-13), lossy captures within
+  0.5 points at 98-100% agreement, 279 MB pooled against 3.5 GB lossless (`results/probes/Qwen-Qwen2.5-72B.md`).
+- Probe accuracy grows with the model (best layer, last-token row: GPT-2 81.9%, Qwen3-1.7B 87.3%, Qwen3-8B
+  92.9%, Qwen3-32B 94.3%, Qwen2.5-72B 96.1%) while the lossy regimes' cost shrinks: GPT-2's last layer lost 7-9
+  points, the 8B-72B models lose at most 0.9.
 - Replayed features equal the lossless capture's (rel L2 0 on GPT-2, 1.5e-12 on Qwen3-1.7B, 6e-11 on Qwen3-8B,
-  3e-12 on Qwen3-32B).
+  3e-12 on Qwen3-32B, 2.5e-12 on Qwen2.5-72B).
 
 ## Summary
 
