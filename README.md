@@ -51,7 +51,8 @@ r.tokens(2); r.header["model"]; r.header["layers"][1]["fidelity"]
   (`compile=True` gives the lower numbers) with about 150 MiB of working memory plus the buffered streams;
   GPT-2 small, whose forward is only 36 ms, 24-30% slower. DESIGN.md has the table and the path to under 1%.
 - Tokens: taken from each call by a pre-hook on the root model (`input_ids`, `attention_mask`, and the KV-cache
-  signal that tells a generation step from a new prompt); `sink.tokens(ids)` overrides, `tokens="off"` disables.
+  signal that tells a generation step from a new prompt); `sink.tokens(ids)` overrides, `tokens="off"` stores no token ids (the attention mask is still read and stored:
+  pooling needs it to skip padding).
 - `sink.annotate(doc_id=[...], split="train")` labels the sequences the next new-sequence call starts; labels become
   Parquet columns.
 - `codec`: one object for how activations are stored, lossy or lossless: `rc.Codec("compact", level=5)`,

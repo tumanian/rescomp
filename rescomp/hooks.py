@@ -7,7 +7,7 @@ output as the forward pass produces it, and track the lifecycle of one forward c
 
 Per forward call: the pre-hook on the root module (if there is one) opens a `call` record and takes the tokens
 from the call's arguments (`input_ids` keyword or first positional tensor, `attention_mask`, and the KV-cache
-signal that tells a generation step from a new prompt); each hooked layer's forward hook passes (layer, output,
+signal that tells a generation step from a new prompt; with tokens=False only the ids are left out); each hooked layer's forward hook passes (layer, output,
 call) to `on_layer`, whose return value, if not None, replaces the layer's output in the model; when the last
 hooked layer fires, `on_end(call)` runs. A call whose last hooked layer never fires counts as incomplete.
 `give_tokens(ids, mask)` supplies the next call's tokens explicitly instead of the pre-hook.
@@ -108,11 +108,13 @@ class CallHooks:
             self._given = None
 
     def _pre_hook(self, mod, args, kwargs):
+        """The attention mask and the cache signal are always read (pooling needs the mask to skip padding); the
+        token ids only when tokens are recorded."""
         self._begin()
-        if self.record_tokens and not self.call["given"]:
+        if not self.call["given"]:
             extract = self.layers.extract or extract_tokens_generic
             ids, mask, cont = extract(args, kwargs)
-            self.call.update(ids=None if ids is None else ids.detach().cpu(),
+            self.call.update(ids=None if ids is None or not self.record_tokens else ids.detach().cpu(),
                              mask=None if mask is None else mask.detach().cpu(), cont=cont)
 
     def _layer_hook(self, l, out):

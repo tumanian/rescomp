@@ -126,6 +126,23 @@ def test_chunks_accumulate_across_calls(lm, tmp_path):
             r.pooled(1, "mean")
 
 
+def test_tokens_off_still_pools_over_real_tokens_only(lm, tmp_path):
+    """tokens="off" stores no token ids, but the attention mask is still read: the rows skip the padding, and
+    pooled() on a full capture taken the same way agrees."""
+    toks = torch.randint(0, V, (4, 7), generator=torch.Generator().manual_seed(7))
+    mask = random_mask(4, 7, 8)
+    with rc.TransformSink(str(tmp_path / "pool"), layers_of(lm), tokens="off") as sink:
+        lm(toks, attention_mask=mask)
+    with rc.Sink(str(tmp_path / "full"), layers_of(lm), "fp32", tokens="off") as sink:
+        lm(toks, attention_mask=mask)
+    exp = masked_reference(lm.activations(toks, (0, 1, 2))[2], mask)
+    with rc.open(str(tmp_path / "pool")) as r, rc.open(str(tmp_path / "full")) as f:
+        assert r.tokens() == [None] * 4 and f.tokens() == [None] * 4
+        assert torch.equal(torch.stack(r.attention_mask()).long(), mask)
+        assert torch.equal(r.pooled(2, "last"), exp[:, 1]) and torch.equal(r.pooled(2, "mean"), exp[:, 0])
+        assert torch.equal(f.pooled(2, "last"), exp[:, 1]) and torch.allclose(f.pooled(2, "mean"), exp[:, 0], atol=1e-6)
+
+
 def test_continuation_calls_are_skipped(lm, tmp_path):
     """Generation-style one-token calls after a prompt (the Sink's continuation rule) store nothing: the rows
     and the tokens describe the prompt only."""

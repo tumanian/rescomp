@@ -9,7 +9,8 @@
 `layers` is a `Layers` (from `bind`) or a plain {layer: nn.Module} dict; the hook on each module
 takes its output (the residual stream after that layer). Tokens: given with `sink.tokens(ids, mask)` before a
 forward, or taken by a forward pre-hook on the root model (`input_ids` keyword or first positional argument);
-`tokens="off"` records none.
+`tokens="off"` stores no token ids; the attention mask and the cache signal are still read and the mask stored
+(pooling needs it to skip padding).
 
 What happens where: each layer's hook quantizes that layer on the model's device as soon as it is produced
 (cheap map-and-reduce work, closed-loop deltas included) and returns; the encoded streams stay on the device,
