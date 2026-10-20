@@ -403,8 +403,8 @@ source; in brackets, agreement with the same probe's predictions on the lossless
 
 - **The TransformSink's rows are the lossless capture's pooled rows, bit for bit** on both models (error 0 on
   every layer and row but one mean at 6e-12, the GPU's summation order). A probe trained on either capture gives
-  the same predictions on the other, so a probe study can use the 11-12x smaller pooled capture (100-300x smaller
-  at the sequence lengths of the overhead table) and the full capture interchangeably.
+  the same predictions on the other, so a probe study can use the 11-12x smaller pooled capture (70-140x smaller
+  at the 256-512 token sequences of the overhead table) and the full capture interchangeably.
 - **Lossy full captures work for probes on keyframe and middle layers; the last layer of GPT-2 does not.** On
   the keyframe layer `balanced` is exact (bf16 keyframes) and `compact` costs at most 2 points (93-97% agreement).
   On the int4 delta layers of Qwen3-1.7B the probes keep their accuracy within 1 point (92-99% agreement) even at

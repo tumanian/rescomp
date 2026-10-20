@@ -1,8 +1,9 @@
 # rescomp
 
 Compress the residual-stream activations of a running transformer and keep them, with the tokens, labels and
-model metadata that interpretability work needs later. Pure PyTorch + zstd + Parquet, CPU or GPU, any framework
-whose layers are `nn.Module`s. 
+model metadata that interpretability work needs later; or keep only a mean and a last-token row per sequence, which
+is what most probes train on. Pure PyTorch + zstd + Parquet, CPU or GPU, any framework whose layers are
+`nn.Module`s.
 
 - `DESIGN.md`: the design decisions behind the sink and the storage layout.
 - `RESULTS.md`: what each codec costs, measured on eight models (GPT-2 to Qwen3-30B-A3B, dense and MoE).
@@ -18,6 +19,47 @@ pytest                      # ~155 tests, CPU only, under a minute
 ```
 
 ## Use
+
+### Pooled rows for probes
+
+A probe wants one vector per sequence, not one per token. `rc.TransformSink` hooks the model like the `Sink`
+below but stores only a few rows per sequence: the mean over the real tokens and the last real token. Measured on
+SST-2 (RESULTS.md): the rows equal a lossless full capture's pooled rows bit for bit, probes trained on either
+give the same predictions, the capture is 11-12x smaller than the full one on short sentences (70-140x at 256-512
+tokens), and reading it is 4-16x faster than replaying the model to get the same features. `model` and `tok` are
+loaded as in the Sink example below.
+
+```python
+sink = rc.TransformSink("runs/sst2", layers=rc.bind(model, [14, 21], tokenizer=tok))   # mean + last rows, fp32
+with sink, torch.no_grad():
+    for texts, labels in loader:
+        sink.annotate(label=labels)                     # one label per sentence, stored next to its rows
+        model(**tok(texts, return_tensors="pt", padding=True).to("cuda"))
+r = rc.open("runs/sst2")
+X, y = r.pooled(21, "mean").numpy(), r.annotation("label")   # [N, d] in sequence order; or "last"
+from sklearn.linear_model import LogisticRegression
+probe = LogisticRegression(max_iter=1000).fit(X[:2000], y[:2000]); print(probe.score(X[2000:], y[2000:]))
+```
+
+- Each layer's hook pools the activation on the device (`[B, T, d]` -> `[B, 2, d]` fp32); the rows accumulate per
+  layer until `chunk_seqs` (4096) sequences are in, then go through the codec and into the store as one chunk.
+  The site becomes `resid_post.mean+last`; `r.pooled_rows` names the rows, `r.read(21)` gives the `[2, d]` rows
+  of each sequence.
+- The default codec is `"fp32"`: the rows are stored bit for bit (a mean is an fp32 value, so the `"exact"`
+  regime, an fp16 cast, would round it to about 5e-4 relative; it still stores the last token of a bf16 model bit
+  for bit and takes 1.5x less space). The lossy regimes work as well (outlier channels are chosen on the first chunk).
+- A KV-cache continuation call (a generation step) is skipped: the rows and the stored tokens describe the prompt.
+- Cost (A10G, `scripts/pooling_overhead.py`): Qwen3-8B with 12 hooked layers runs 0.7% slower, GPT-2 small 18%
+  (a fixed 0.4-1.6 ms per hooked layer); memory is the accumulated rows only (k x d x 4 bytes per sequence per
+  layer). Stored: 20 KB per sequence per layer on Qwen3-8B (13 KB with `exact`), 141x less than an `exact` full
+  capture and 41x less than `compact`. DESIGN.md has the table.
+- `scripts/probes.py` trains logistic-regression probes (SST-2) on the pooled rows of a lossless full capture and
+  of a TransformSink capture, tests each on the other and on the lossy regimes, and times each way of getting the
+  features (read the pooled capture, read the full capture, replay the model); RESULTS.md has the tables.
+- `r.pooled(layer, "mean")` also works on a full capture from a `Sink`: the row is computed from the stored
+  tokens with the attention mask, so a probe reads either kind of capture the same way.
+
+### Every token: the Sink
 
 ```python
 import torch, rescomp as rc
@@ -88,42 +130,6 @@ one layer at a time on the model's device (closed-loop deltas); `codec.pack(t)` 
 half; `rc.Store(stem, model=..., layers=..., codec=...)` to write encoded chunks yourself; `rc.transcode(src, dst,
 codec)` to re-encode a stored capture with another codec or regime; `reader.codec` is the one a file was written
 with. `rescomp.bf16_wrapper.choose_channels(X, spec)` picks outlier channels from a sample offline.
-
-### Pooled rows for probes
-
-A probe wants one vector per sequence, not one per token. `rc.TransformSink` is a `Sink` that stores a few rows
-per sequence instead of every token: the attention-mask-weighted mean over the real tokens and the last real
-token (`transform="mean+last"`, the default; also `"mean"` or `"last"`). Same hooks, tokens, annotations, flush
-and S3 as the `Sink`.
-
-```python
-sink = rc.TransformSink("runs/probe", layers=rc.bind(model, [20, 28], tokenizer=tok))   # codec "fp32" by default
-with sink, torch.no_grad():
-    for batch in loader:
-        sink.annotate(label=batch["label"])
-        model(**batch)                                 # the prompt only; generate() steps are skipped
-r = rc.open("runs/probe")
-X = r.pooled(28, "mean")                               # [N, d] fp32, in sequence order
-y = r.annotation("label")
-```
-
-- Each layer's hook pools the activation on the device (`[B, T, d]` -> `[B, 2, d]` fp32); the rows accumulate per
-  layer until `chunk_seqs` (4096) sequences are in, then go through the codec and into the store as one chunk.
-  The site becomes `resid_post.mean+last`; `r.pooled_rows` names the rows, `r.read(28)` gives the `[2, d]` rows
-  of each sequence.
-- The default codec is `"fp32"`: the rows are stored bit for bit (a mean is an fp32 value, so the `"exact"`
-  regime, an fp16 cast, would round it to about 5e-4 relative; it still stores the last token of a bf16 model bit
-  for bit and takes 1.5x less space). The lossy regimes work as well (outlier channels are chosen on the first chunk).
-- A KV-cache continuation call (a generation step) is skipped: the rows and the stored tokens describe the prompt.
-- Cost (A10G, `scripts/pooling_overhead.py`): Qwen3-8B with 12 hooked layers runs 0.7% slower, GPT-2 small 18%
-  (a fixed 0.4-1.6 ms per hooked layer); memory is the accumulated rows only (k x d x 4 bytes per sequence per
-  layer). Stored: 20 KB per sequence per layer on Qwen3-8B (13 KB with `exact`), 141x less than an `exact` full
-  capture and 41x less than `compact`. DESIGN.md has the table.
-- `scripts/probes.py` trains logistic-regression probes (SST-2) on the pooled rows of a lossless full capture and
-  of a TransformSink capture and tests each on the other and on the lossy regimes: the two captures give the same
-  features bit for bit and the same predictions; RESULTS.md has the table.
-- `r.pooled(layer, "mean")` also works on a full capture from a `Sink`: the row is computed from the stored
-  tokens with the attention mask, so a probe reads either kind of capture the same way.
 
 ## Regimes
 
